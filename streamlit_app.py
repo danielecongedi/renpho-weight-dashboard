@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from pathlib import Path
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time
 
 # -------------------------
 # PAGE
@@ -15,14 +15,14 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Riduci font globale di ~1px
+# Font globale ~ -1px
 st.markdown(
     """
     <style>
       html, body, [class*="css"] { font-size: 15px; }
     </style>
     """,
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
 
 # -------------------------
@@ -37,6 +37,23 @@ DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 MANUAL_FILE = DATA_DIR / "manual_entries.csv"
 
+# -------------------------
+# HELPERS
+# -------------------------
+def ts_at_midnight(d: date) -> pd.Timestamp:
+    return pd.Timestamp(datetime.combine(d, time.min))
+
+def format_delta(value: float | None, decimals: int = 2) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    return f"{value:+.{decimals}f}"
+
+def next_saturday(d: date) -> date:
+    # weekday(): Mon=0 ... Sat=5 ... Sun=6
+    days_ahead = (5 - d.weekday()) % 7
+    return d + timedelta(days=days_ahead)
 
 # -------------------------
 # LOADERS
@@ -72,7 +89,6 @@ def load_renpho_csv(url: str) -> pd.DataFrame:
     df["bmi"] = np.nan
     return df
 
-
 def load_manual() -> pd.DataFrame:
     if not MANUAL_FILE.exists():
         return pd.DataFrame(columns=["date", "weight", "bmi", "source"])
@@ -85,12 +101,10 @@ def load_manual() -> pd.DataFrame:
     df = df.sort_values("date").drop_duplicates(subset=["date"], keep="last")
     return df
 
-
 def save_manual(df: pd.DataFrame) -> None:
     out = df.copy()
     out = out.sort_values("date").drop_duplicates(subset=["date"], keep="last")
     out.to_csv(MANUAL_FILE, index=False)
-
 
 def combine_data(renpho_df: pd.DataFrame, manual_df: pd.DataFrame) -> pd.DataFrame:
     if manual_df.empty:
@@ -103,7 +117,6 @@ def combine_data(renpho_df: pd.DataFrame, manual_df: pd.DataFrame) -> pd.DataFra
         df = df.drop_duplicates(subset=["date"], keep="last")
     return df.sort_values("date").reset_index(drop=True)
 
-
 # -------------------------
 # FEATURE ENGINEERING
 # -------------------------
@@ -112,9 +125,8 @@ def add_bmi_if_missing(df: pd.DataFrame, height_m: float) -> pd.DataFrame:
     if height_m <= 0:
         return df
     miss = df["bmi"].isna() & df["weight"].notna()
-    df.loc[miss, "bmi"] = df.loc[miss, "weight"] / (height_m ** 2)
+    df.loc[miss, "bmi"] = df.loc[miss, "weight"] / (height_m**2)
     return df
-
 
 def make_daily_series(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
@@ -127,8 +139,7 @@ def make_daily_series(df: pd.DataFrame) -> pd.DataFrame:
     out["source"] = "daily"
     return out.sort_values("date").reset_index(drop=True)
 
-
-def pick_today_prefer_manual(df: pd.DataFrame):
+def pick_today_prefer_manual(df: pd.DataFrame) -> pd.Series:
     df = df.sort_values("date").copy()
     last_day = df["date"].dt.date.max()
     day_df = df[df["date"].dt.date == last_day].copy()
@@ -137,20 +148,12 @@ def pick_today_prefer_manual(df: pd.DataFrame):
         return man.sort_values("date").iloc[-1]
     return day_df.sort_values("date").iloc[-1]
 
-
-def day_before_value(daily_df: pd.DataFrame, day: date):
+def day_before_value(daily_df: pd.DataFrame, day: date) -> pd.Series | None:
     prev = day - timedelta(days=1)
     row = daily_df[daily_df["date"].dt.date == prev]
     if row.empty:
         return None
     return row.iloc[-1]
-
-
-def format_delta(value: float, decimals=2):
-    if value is None or (isinstance(value, float) and not np.isfinite(value)):
-        return None
-    return f"{value:+.{decimals}f}"
-
 
 # -------------------------
 # MODEL (stabilizzato)
@@ -184,16 +187,9 @@ def fit_linear_model(daily_df: pd.DataFrame, lookback_days: int) -> dict:
 
     return {"ok": True, "m": m, "b": b, "t0": t0, "sub": sub}
 
-
 def predict_weight(model: dict, when: pd.Timestamp) -> float:
     x = (when - model["t0"]).total_seconds() / 86400.0
     return float(model["m"] * x + model["b"])
-
-
-def next_saturday(d: date) -> date:
-    days_ahead = (5 - d.weekday()) % 7
-    return d + timedelta(days=days_ahead)
-
 
 # -------------------------
 # SECRETS
@@ -202,7 +198,6 @@ csv_url = st.secrets.get("CSV_URL", "")
 if not csv_url:
     st.error("CSV_URL non impostato. Mettilo nei Secrets.")
     st.stop()
-
 
 # -------------------------
 # SIDEBAR
@@ -234,7 +229,6 @@ with st.sidebar:
         load_renpho_csv.clear()
         st.rerun()
 
-
 # -------------------------
 # LOAD DATA
 # -------------------------
@@ -255,14 +249,29 @@ if df.empty:
 daily = make_daily_series(df)
 daily["ma"] = daily["weight"].rolling(ma_window, min_periods=1).mean()
 
-# filtro date
+# -------------------------
+# DATE FILTER (INTERVALLO ANALISI) + GIORNO DI VISUALIZZAZIONE
+# -------------------------
 min_date = df["date"].min().date()
 max_date = df["date"].max().date()
-date_range = st.sidebar.date_input("📅 Intervallo analisi", value=(min_date, max_date), min_value=min_date, max_value=max_date)
+
+date_range = st.sidebar.date_input(
+    "📅 Intervallo analisi",
+    value=(min_date, max_date),
+    min_value=min_date,
+    max_value=max_date,
+)
+
 if isinstance(date_range, tuple) and len(date_range) == 2:
     start_d, end_d = date_range
 else:
     start_d, end_d = min_date, max_date
+
+# Giorno di visualizzazione corrente (fine intervallo selezionato)
+view_day = end_d
+view_day_ts = ts_at_midnight(view_day)
+next_view_day = view_day + timedelta(days=1)
+next_view_day_ts = ts_at_midnight(next_view_day)
 
 df_f = df[(df["date"].dt.date >= start_d) & (df["date"].dt.date <= end_d)].copy()
 daily_f = daily[(daily["date"].dt.date >= start_d) & (daily["date"].dt.date <= end_d)].copy()
@@ -274,7 +283,7 @@ if df_f.empty:
 daily_f["ma"] = daily_f["weight"].rolling(ma_window, min_periods=1).mean()
 
 # -------------------------
-# CURRENT "LAST" (prefer manual today)
+# CURRENT "LAST" (prefer manual today) within filtered data
 # -------------------------
 last_row = pick_today_prefer_manual(df_f)
 last_day = last_row["date"].date()
@@ -309,18 +318,19 @@ if model.get("ok", False) and prevent_upward_forecast and model["m"] > 0:
     model = dict(model)
     model["m"] = 0.0
 
+# stima data target
 target_date_est = None
 days_to_target = None
 if model.get("ok", False) and model["m"] < 0:
     x_target = (float(target_weight) - model["b"]) / model["m"]
     if np.isfinite(x_target) and x_target >= 0:
         target_date_est = (model["t0"] + pd.Timedelta(days=float(x_target))).date()
-        days_to_target = (target_date_est - last_day).days
+        days_to_target = (target_date_est - view_day).days
 
-tomorrow = last_day + timedelta(days=1)
-pred_tomorrow = None
+# forecast del giorno successivo al giorno di visualizzazione
+pred_next_view_day = None
 if model.get("ok", False):
-    pred_tomorrow = predict_weight(model, pd.Timestamp(datetime.combine(tomorrow, datetime.min.time())))
+    pred_next_view_day = predict_weight(model, next_view_day_ts)
 
 # -------------------------
 # TABS
@@ -337,43 +347,43 @@ with tab_dash:
     c1, c2, c3, c4, c5, c6 = st.columns(6)
 
     c1.metric(
-        "Ultima misura (oggi)",
+        "Ultima misura",
         f"{last_weight:.2f} kg",
-        (format_delta(delta_w, 2) + " kg vs ieri") if delta_w is not None else "—",
-        delta_color="inverse"
+        f"{last_row['date'].strftime('%d %b %H:%M')}",
+        delta_color="off",
     )
 
     c2.metric(
-        "BMI (oggi)",
+        "BMI (ultima misura)",
         f"{last_bmi:.2f}" if np.isfinite(last_bmi) else "—",
         (format_delta(delta_bmi, 2) + " vs ieri") if delta_bmi is not None else "—",
-        delta_color="inverse"
+        delta_color="inverse",
     )
 
     c3.metric(
         "Perdita vs baseline",
         f"{loss_from_baseline:+.2f} kg",
         (format_delta(delta_loss, 2) + " kg vs ieri") if delta_loss is not None else "—",
-        delta_color="normal"
+        delta_color="normal",
     )
 
     c4.metric(
         "Distanza dal target",
         f"{dist_to_target:+.2f} kg",
         (format_delta(delta_dist, 2) + " kg vs ieri") if delta_dist is not None else "—",
-        delta_color="inverse"
+        delta_color="inverse",
     )
 
     c5.metric(
         "Data target stimata",
         target_date_est.strftime("%d %b") if target_date_est else "—",
-        (f"{days_to_target} giorni mancanti") if days_to_target is not None else "—"
+        (f"{days_to_target} giorni (da {view_day.strftime('%d %b')})") if days_to_target is not None else "—",
     )
 
     c6.metric(
-        "Forecast domani",
-        f"{pred_tomorrow:.2f} kg" if pred_tomorrow is not None else "—",
-        tomorrow.strftime("%d %b")
+        f"Forecast {next_view_day.strftime('%d %b')}",
+        f"{pred_next_view_day:.2f} kg" if pred_next_view_day is not None else "—",
+        f"giorno successivo a {view_day.strftime('%d %b')}",
     )
 
     st.markdown("---")
@@ -382,50 +392,84 @@ with tab_dash:
     fig = go.Figure()
 
     if show_raw:
-        fig.add_trace(go.Scatter(
-            x=df_f["date"], y=df_f["weight"],
-            mode="markers",
-            name="RAW",
-            hovertemplate="Data: %{x}<br>Peso: %{y:.2f} kg<extra></extra>"
-        ))
+        fig.add_trace(
+            go.Scatter(
+                x=df_f["date"],
+                y=df_f["weight"],
+                mode="markers",
+                name="RAW",
+                hovertemplate="Data: %{x}<br>Peso: %{y:.2f} kg<extra></extra>",
+            )
+        )
 
     if show_daily:
-        fig.add_trace(go.Scatter(
-            x=daily_f["date"], y=daily_f["weight"],
-            mode="lines+markers",
-            name="DAILY (mediana/giorno)",
-            hovertemplate="Giorno: %{x}<br>Peso daily: %{y:.2f} kg<extra></extra>"
-        ))
+        fig.add_trace(
+            go.Scatter(
+                x=daily_f["date"],
+                y=daily_f["weight"],
+                mode="lines+markers",
+                name="DAILY (mediana/giorno)",
+                hovertemplate="Giorno: %{x}<br>Peso daily: %{y:.2f} kg<extra></extra>",
+            )
+        )
 
-        fig.add_trace(go.Scatter(
-            x=daily_f["date"], y=daily_f["ma"],
-            mode="lines",
-            name=f"MA({ma_window}gg)",
-            hovertemplate="Giorno: %{x}<br>MA: %{y:.2f} kg<extra></extra>"
-        ))
+        fig.add_trace(
+            go.Scatter(
+                x=daily_f["date"],
+                y=daily_f["ma"],
+                mode="lines",
+                name=f"MA({ma_window}gg)",
+                hovertemplate="Giorno: %{x}<br>MA: %{y:.2f} kg<extra></extra>",
+            )
+        )
 
+    # Target line
     fig.add_hline(
         y=float(target_weight),
         line_dash="dash",
         annotation_text="🎯 Target",
-        annotation_position="bottom right"
+        annotation_position="bottom right",
     )
 
-    # forecast (orizzonte selezionabile)
+    # Evidenzia l'istante dell'ultima misura (vertical line)
+    fig.add_vline(
+        x=last_row["date"],
+        line_dash="dot",
+        annotation_text=f"Ultima misura ({last_row['date'].strftime('%d %b %H:%M')})",
+        annotation_position="top left",
+    )
+
+    # Forecast (orizzonte selezionabile)
     if model.get("ok", False) and len(daily_f) >= 2:
         last_dt = daily_f["date"].max()
         horizon_days = int(forecast_horizon)
-
         future_dates = pd.date_range(last_dt, last_dt + pd.Timedelta(days=horizon_days), freq="D")
         y_fore = [predict_weight(model, d) for d in future_dates]
 
-        fig.add_trace(go.Scatter(
-            x=future_dates, y=y_fore,
-            mode="lines",
-            name=f"Forecast ({horizon_days}g)",
-            line=dict(dash="dash"),
-            hovertemplate="Data: %{x}<br>Forecast: %{y:.2f} kg<extra></extra>"
-        ))
+        fig.add_trace(
+            go.Scatter(
+                x=future_dates,
+                y=y_fore,
+                mode="lines",
+                name=f"Forecast ({horizon_days}g)",
+                line=dict(dash="dash"),
+                hovertemplate="Data: %{x}<br>Forecast: %{y:.2f} kg<extra></extra>",
+            )
+        )
+
+    # Punto forecast del giorno successivo al giorno visualizzato
+    if model.get("ok", False) and pred_next_view_day is not None:
+        fig.add_trace(
+            go.Scatter(
+                x=[next_view_day_ts],
+                y=[pred_next_view_day],
+                mode="markers+text",
+                name="Forecast giorno successivo",
+                text=[f"{pred_next_view_day:.2f} kg"],
+                textposition="top center",
+                hovertemplate="Data: %{x}<br>Forecast: %{y:.2f} kg<extra></extra>",
+            )
+        )
 
     fig.update_layout(
         font=dict(size=11),
@@ -450,7 +494,7 @@ with tab_dash:
     st.dataframe(
         last10[["Data", "Peso (kg)", "BMI", "Origine"]],
         use_container_width=True,
-        hide_index=True
+        hide_index=True,
     )
 
 # -------------------------
@@ -470,14 +514,16 @@ with tab_manual:
         submitted = st.form_submit_button("✅ Salva", use_container_width=True)
         if submitted:
             dt = pd.Timestamp(datetime.combine(m_date, m_time))
-            bmi_val = float(m_bmi) if float(m_bmi) > 0 else (float(m_weight) / (height_m ** 2) if height_m > 0 else np.nan)
+            bmi_val = float(m_bmi) if float(m_bmi) > 0 else (float(m_weight) / (height_m**2) if height_m > 0 else np.nan)
 
-            new_row = pd.DataFrame([{
-                "date": dt,
-                "weight": float(m_weight),
-                "bmi": bmi_val,
-                "source": "manual"
-            }])
+            new_row = pd.DataFrame(
+                [{
+                    "date": dt,
+                    "weight": float(m_weight),
+                    "bmi": bmi_val,
+                    "source": "manual",
+                }]
+            )
 
             manual_now = load_manual()
             manual_now = pd.concat([manual_now, new_row], ignore_index=True)
@@ -516,7 +562,7 @@ with tab_manual:
             st.rerun()
 
 # -------------------------
-# FORECAST (sabati fino a target)
+# FORECAST (sabati fino a target) — rimuovi sabati già passati rispetto al view_day
 # -------------------------
 with tab_forecast:
     st.subheader("Forecast settimanale (sabati) fino al target")
@@ -526,24 +572,30 @@ with tab_forecast:
     elif not target_date_est:
         st.warning("Data target non stimabile: non posso calcolare i sabati fino al target.")
     else:
-        st.success(f"Sabati fino al target stimato: {target_date_est.strftime('%d %b')}")
-        start_sat = next_saturday(last_day)
+        # Parti dal prossimo sabato rispetto al GIORNO DI VISUALIZZAZIONE, non rispetto all'ultima misura
+        start_sat = next_saturday(view_day)
+        if start_sat <= view_day:
+            start_sat = start_sat + timedelta(days=7)
 
-        rows = []
-        s = start_sat
-        while s <= target_date_est:
-            ts = pd.Timestamp(datetime.combine(s, datetime.min.time()))
-            w_pred = predict_weight(model, ts)
-            rows.append({
-                "Sabato": s.strftime("%d %b"),
-                "Peso previsto (kg)": round(w_pred, 2),
-                "Distanza dal target (kg)": round(w_pred - float(target_weight), 2)
-            })
-            s += timedelta(days=7)
-
-        if not rows:
-            st.info("Il target è stimato prima del prossimo sabato.")
+        if target_date_est < start_sat:
+            st.info(f"Il target è stimato prima del prossimo sabato ({start_sat.strftime('%d %b')}).")
         else:
+            st.success(f"Sabati (da {start_sat.strftime('%d %b')}) fino al target stimato: {target_date_est.strftime('%d %b')}")
+
+            rows = []
+            s = start_sat
+            while s <= target_date_est:
+                ts = ts_at_midnight(s)
+                w_pred = predict_weight(model, ts)
+                rows.append(
+                    {
+                        "Sabato": s.strftime("%d %b"),
+                        "Peso previsto (kg)": round(w_pred, 2),
+                        "Distanza dal target (kg)": round(w_pred - float(target_weight), 2),
+                    }
+                )
+                s += timedelta(days=7)
+
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 # -------------------------
@@ -565,5 +617,5 @@ with tab_data:
         data=out[["Data", "Peso (kg)", "BMI", "Origine"]].to_csv(index=False).encode("utf-8"),
         file_name="renpho_dataset_export.csv",
         mime="text/csv",
-        use_container_width=True
+        use_container_width=True,
     )
