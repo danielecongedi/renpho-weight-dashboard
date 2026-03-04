@@ -50,15 +50,15 @@ def format_delta(value: float | None, decimals: int = 2) -> str | None:
     return f"{value:+.{decimals}f}"
 
 def next_saturday(d: date) -> date:
-    days_ahead = (5 - d.weekday()) % 7
+    days_ahead = (5 - d.weekday()) % 7  # Sat=5
     return d + timedelta(days=days_ahead)
 
-def add_vline_robust(fig: go.Figure, x_dt: pd.Timestamp, text: str):
+def add_vline_robust(fig: go.Figure, x_dt, text: str):
     """
     Plotly add_vline con annotation su datetime può generare TypeError (sum su datetime).
-    Soluzione: usa 'shapes' + 'annotations' manuali, senza add_vline.
+    Soluzione: usa shapes+annotations (robusto).
     """
-    x_py = pd.to_datetime(x_dt).to_pydatetime()  # python datetime
+    x_py = pd.to_datetime(x_dt).to_pydatetime()
     fig.add_shape(
         type="line",
         xref="x",
@@ -137,6 +137,7 @@ def combine_data(renpho_df: pd.DataFrame, manual_df: pd.DataFrame) -> pd.DataFra
         df = renpho_df.copy()
     else:
         df = pd.concat([renpho_df, manual_df], ignore_index=True)
+        # priorità manual in caso di stesso timestamp
         df["__prio"] = df["source"].map({"renpho": 0, "manual": 1}).fillna(0)
         df = df.sort_values(["date", "__prio"]).drop(columns=["__prio"])
         df = df.drop_duplicates(subset=["date"], keep="last")
@@ -172,13 +173,6 @@ def pick_last_prefer_manual(df: pd.DataFrame) -> pd.Series:
     if not man.empty:
         return man.sort_values("date").iloc[-1]
     return day_df.sort_values("date").iloc[-1]
-
-def day_before_value(daily_df: pd.DataFrame, day: date) -> pd.Series | None:
-    prev = day - timedelta(days=1)
-    row = daily_df[daily_df["date"].dt.date == prev]
-    if row.empty:
-        return None
-    return row.iloc[-1]
 
 # -------------------------
 # MODEL (stabilizzato)
@@ -302,38 +296,42 @@ if df_f.empty:
 daily_f["ma"] = daily_f["weight"].rolling(ma_window, min_periods=1).mean()
 
 # -------------------------
-# OGGI (sempre) + DOMANI (sempre)
+# OGGI + DOMANI (sempre)
 # -------------------------
 today = date.today()
 tomorrow = today + timedelta(days=1)
 tomorrow_ts = ts_at_midnight(tomorrow)
 
 # -------------------------
-# LAST MEASURE (nell'intervallo)
+# LAST & PREVIOUS MEASURE (vs ultima misura)
 # -------------------------
 last_row = pick_last_prefer_manual(df_f)
-last_day = last_row["date"].date()
+last_dt = pd.to_datetime(last_row["date"])
 last_weight = float(last_row["weight"])
 last_bmi = float(last_row["bmi"]) if pd.notna(last_row["bmi"]) else np.nan
 
-yesterday_row = day_before_value(daily_f, last_day)
-if yesterday_row is not None:
-    w_y = float(yesterday_row["weight"])
-    bmi_y = float(yesterday_row["bmi"]) if pd.notna(yesterday_row["bmi"]) else np.nan
-else:
-    w_y, bmi_y = None, None
+prev_df = df_f[df_f["date"] < last_dt].sort_values("date")
+prev_row = prev_df.iloc[-1] if not prev_df.empty else None
 
-delta_w = (last_weight - w_y) if w_y is not None else None
-delta_bmi = (last_bmi - bmi_y) if (bmi_y is not None and np.isfinite(last_bmi) and np.isfinite(bmi_y)) else None
+if prev_row is not None:
+    prev_weight = float(prev_row["weight"])
+    prev_bmi = float(prev_row["bmi"]) if pd.notna(prev_row["bmi"]) else np.nan
+else:
+    prev_weight, prev_bmi = None, None
+
+delta_w = (last_weight - prev_weight) if prev_weight is not None else None
+delta_bmi = (last_bmi - prev_bmi) if (prev_bmi is not None and np.isfinite(last_bmi) and np.isfinite(prev_bmi)) else None
 
 loss_from_baseline = float(baseline_weight - last_weight)
 dist_to_target = float(last_weight - float(target_weight))
 
-loss_y = (baseline_weight - w_y) if w_y is not None else None
-delta_loss = (loss_from_baseline - loss_y) if loss_y is not None else None
-
-dist_y = (w_y - float(target_weight)) if w_y is not None else None
-delta_dist = (dist_to_target - dist_y) if dist_y is not None else None
+if prev_weight is not None:
+    loss_prev = float(baseline_weight - prev_weight)
+    dist_prev = float(prev_weight - float(target_weight))
+    delta_loss = float(loss_from_baseline - loss_prev)
+    delta_dist = float(dist_to_target - dist_prev)
+else:
+    delta_loss, delta_dist = None, None
 
 # -------------------------
 # MODEL + FORECAST (domani rispetto a oggi)
@@ -373,28 +371,28 @@ with tab_dash:
     c1.metric(
         "Ultima misura",
         f"{last_weight:.2f} kg",
-        f"{last_row['date'].strftime('%d %b %H:%M')}",
+        f"{last_dt.strftime('%d %b %H:%M')}",
         delta_color="off",
     )
 
     c2.metric(
         "BMI (ultima misura)",
         f"{last_bmi:.2f}" if np.isfinite(last_bmi) else "—",
-        (format_delta(delta_bmi, 2) + " vs ieri") if delta_bmi is not None else "—",
+        (format_delta(delta_bmi, 2) + " vs ultima misura") if delta_bmi is not None else "—",
         delta_color="inverse",
     )
 
     c3.metric(
         "Perdita vs baseline",
         f"{loss_from_baseline:+.2f} kg",
-        (format_delta(delta_loss, 2) + " kg vs ieri") if delta_loss is not None else "—",
+        (format_delta(delta_loss, 2) + " kg vs ultima misura") if delta_loss is not None else "—",
         delta_color="normal",
     )
 
     c4.metric(
         "Distanza dal target",
         f"{dist_to_target:+.2f} kg",
-        (format_delta(delta_dist, 2) + " kg vs ieri") if delta_dist is not None else "—",
+        (format_delta(delta_dist, 2) + " kg vs ultima misura") if delta_dist is not None else "—",
         delta_color="inverse",
     )
 
@@ -404,7 +402,6 @@ with tab_dash:
         (f"{days_to_target} giorni (da oggi)") if days_to_target is not None else "—",
     )
 
-    # ✅ forecast sempre del giorno successivo a OGGI (non dipende dalla misura inserita)
     c6.metric(
         f"Forecast {tomorrow.strftime('%d %b')}",
         f"{pred_tomorrow:.2f} kg" if pred_tomorrow is not None else "—",
@@ -418,8 +415,7 @@ with tab_dash:
 
     if show_raw:
         fig.add_trace(go.Scatter(
-            x=df_f["date"],
-            y=df_f["weight"],
+            x=df_f["date"], y=df_f["weight"],
             mode="markers",
             name="RAW",
             hovertemplate="Data: %{x}<br>Peso: %{y:.2f} kg<extra></extra>",
@@ -427,16 +423,13 @@ with tab_dash:
 
     if show_daily:
         fig.add_trace(go.Scatter(
-            x=daily_f["date"],
-            y=daily_f["weight"],
+            x=daily_f["date"], y=daily_f["weight"],
             mode="lines+markers",
             name="DAILY (mediana/giorno)",
             hovertemplate="Giorno: %{x}<br>Peso daily: %{y:.2f} kg<extra></extra>",
         ))
-
         fig.add_trace(go.Scatter(
-            x=daily_f["date"],
-            y=daily_f["ma"],
+            x=daily_f["date"], y=daily_f["ma"],
             mode="lines",
             name=f"MA({ma_window}gg)",
             hovertemplate="Giorno: %{x}<br>MA: %{y:.2f} kg<extra></extra>",
@@ -449,31 +442,26 @@ with tab_dash:
         annotation_position="bottom right",
     )
 
-    # ✅ evidenzia ultima misura senza usare add_vline (evita TypeError)
     add_vline_robust(
         fig,
-        x_dt=last_row["date"],
-        text=f"Ultima misura ({last_row['date'].strftime('%d %b %H:%M')})",
+        x_dt=last_dt,
+        text=f"Ultima misura ({last_dt.strftime('%d %b %H:%M')})",
     )
 
-    # Forecast (orizzonte)
     if model.get("ok", False) and len(daily_f) >= 2:
-        last_dt = daily_f["date"].max()
+        last_daily_dt = daily_f["date"].max()
         horizon_days = int(forecast_horizon)
-
-        future_dates = pd.date_range(last_dt, last_dt + pd.Timedelta(days=horizon_days), freq="D")
+        future_dates = pd.date_range(last_daily_dt, last_daily_dt + pd.Timedelta(days=horizon_days), freq="D")
         y_fore = [predict_weight(model, d) for d in future_dates]
 
         fig.add_trace(go.Scatter(
-            x=future_dates,
-            y=y_fore,
+            x=future_dates, y=y_fore,
             mode="lines",
             name=f"Forecast ({horizon_days}g)",
             line=dict(dash="dash"),
             hovertemplate="Data: %{x}<br>Forecast: %{y:.2f} kg<extra></extra>",
         ))
 
-    # Punto forecast domani (rispetto a OGGI)
     if model.get("ok", False) and pred_tomorrow is not None:
         fig.add_trace(go.Scatter(
             x=[tomorrow_ts.to_pydatetime()],
