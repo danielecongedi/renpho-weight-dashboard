@@ -50,17 +50,36 @@ def format_delta(value: float | None, decimals: int = 2) -> str | None:
     return f"{value:+.{decimals}f}"
 
 def next_saturday(d: date) -> date:
-    days_ahead = (5 - d.weekday()) % 7  # Sat=5
+    days_ahead = (5 - d.weekday()) % 7
     return d + timedelta(days=days_ahead)
 
-def safe_add_vline(fig: go.Figure, x, **kwargs):
+def add_vline_robust(fig: go.Figure, x_dt: pd.Timestamp, text: str):
     """
-    Fix per bug/compatibilità plotly+pandas Timestamp: add_vline prova a fare sum(x)
-    e scoppia con Timestamp. Converte a datetime python.
+    Plotly add_vline con annotation su datetime può generare TypeError (sum su datetime).
+    Soluzione: usa 'shapes' + 'annotations' manuali, senza add_vline.
     """
-    if isinstance(x, (pd.Timestamp, np.datetime64)):
-        x = pd.to_datetime(x).to_pydatetime()
-    fig.add_vline(x=x, **kwargs)
+    x_py = pd.to_datetime(x_dt).to_pydatetime()  # python datetime
+    fig.add_shape(
+        type="line",
+        xref="x",
+        yref="paper",
+        x0=x_py,
+        x1=x_py,
+        y0=0,
+        y1=1,
+        line=dict(dash="dot"),
+    )
+    fig.add_annotation(
+        x=x_py,
+        y=1,
+        xref="x",
+        yref="paper",
+        text=text,
+        showarrow=False,
+        xanchor="left",
+        yanchor="bottom",
+        yshift=6,
+    )
 
 # -------------------------
 # LOADERS
@@ -118,7 +137,6 @@ def combine_data(renpho_df: pd.DataFrame, manual_df: pd.DataFrame) -> pd.DataFra
         df = renpho_df.copy()
     else:
         df = pd.concat([renpho_df, manual_df], ignore_index=True)
-        # priorità manual in caso di stesso timestamp
         df["__prio"] = df["source"].map({"renpho": 0, "manual": 1}).fillna(0)
         df = df.sort_values(["date", "__prio"]).drop(columns=["__prio"])
         df = df.drop_duplicates(subset=["date"], keep="last")
@@ -257,7 +275,7 @@ daily = make_daily_series(df)
 daily["ma"] = daily["weight"].rolling(ma_window, min_periods=1).mean()
 
 # -------------------------
-# DATE FILTER (INTERVALLO ANALISI)
+# DATE FILTER
 # -------------------------
 min_date = df["date"].min().date()
 max_date = df["date"].max().date()
@@ -284,14 +302,14 @@ if df_f.empty:
 daily_f["ma"] = daily_f["weight"].rolling(ma_window, min_periods=1).mean()
 
 # -------------------------
-# "OGGI" REALE (si aggiorna ogni giorno)
+# OGGI (sempre) + DOMANI (sempre)
 # -------------------------
 today = date.today()
 tomorrow = today + timedelta(days=1)
 tomorrow_ts = ts_at_midnight(tomorrow)
 
 # -------------------------
-# CURRENT "LAST" (prefer manual for last day in filtered data)
+# LAST MEASURE (nell'intervallo)
 # -------------------------
 last_row = pick_last_prefer_manual(df_f)
 last_day = last_row["date"].date()
@@ -318,7 +336,7 @@ dist_y = (w_y - float(target_weight)) if w_y is not None else None
 delta_dist = (dist_to_target - dist_y) if dist_y is not None else None
 
 # -------------------------
-# MODEL + FORECAST
+# MODEL + FORECAST (domani rispetto a oggi)
 # -------------------------
 model = fit_linear_model(daily_f, lookback_days=lookback_days)
 
@@ -326,7 +344,10 @@ if model.get("ok", False) and prevent_upward_forecast and model["m"] > 0:
     model = dict(model)
     model["m"] = 0.0
 
-# stima data target (riferita a "today" come riferimento umano)
+pred_tomorrow = None
+if model.get("ok", False):
+    pred_tomorrow = predict_weight(model, tomorrow_ts)
+
 target_date_est = None
 days_to_target = None
 if model.get("ok", False) and model["m"] < 0:
@@ -334,11 +355,6 @@ if model.get("ok", False) and model["m"] < 0:
     if np.isfinite(x_target) and x_target >= 0:
         target_date_est = (model["t0"] + pd.Timedelta(days=float(x_target))).date()
         days_to_target = (target_date_est - today).days
-
-# forecast del giorno successivo a "oggi" (sempre, anche se non inserisco misure)
-pred_tomorrow = None
-if model.get("ok", False):
-    pred_tomorrow = predict_weight(model, tomorrow_ts)
 
 # -------------------------
 # TABS
@@ -388,6 +404,7 @@ with tab_dash:
         (f"{days_to_target} giorni (da oggi)") if days_to_target is not None else "—",
     )
 
+    # ✅ forecast sempre del giorno successivo a OGGI (non dipende dalla misura inserita)
     c6.metric(
         f"Forecast {tomorrow.strftime('%d %b')}",
         f"{pred_tomorrow:.2f} kg" if pred_tomorrow is not None else "—",
@@ -400,36 +417,30 @@ with tab_dash:
     fig = go.Figure()
 
     if show_raw:
-        fig.add_trace(
-            go.Scatter(
-                x=df_f["date"],
-                y=df_f["weight"],
-                mode="markers",
-                name="RAW",
-                hovertemplate="Data: %{x}<br>Peso: %{y:.2f} kg<extra></extra>",
-            )
-        )
+        fig.add_trace(go.Scatter(
+            x=df_f["date"],
+            y=df_f["weight"],
+            mode="markers",
+            name="RAW",
+            hovertemplate="Data: %{x}<br>Peso: %{y:.2f} kg<extra></extra>",
+        ))
 
     if show_daily:
-        fig.add_trace(
-            go.Scatter(
-                x=daily_f["date"],
-                y=daily_f["weight"],
-                mode="lines+markers",
-                name="DAILY (mediana/giorno)",
-                hovertemplate="Giorno: %{x}<br>Peso daily: %{y:.2f} kg<extra></extra>",
-            )
-        )
+        fig.add_trace(go.Scatter(
+            x=daily_f["date"],
+            y=daily_f["weight"],
+            mode="lines+markers",
+            name="DAILY (mediana/giorno)",
+            hovertemplate="Giorno: %{x}<br>Peso daily: %{y:.2f} kg<extra></extra>",
+        ))
 
-        fig.add_trace(
-            go.Scatter(
-                x=daily_f["date"],
-                y=daily_f["ma"],
-                mode="lines",
-                name=f"MA({ma_window}gg)",
-                hovertemplate="Giorno: %{x}<br>MA: %{y:.2f} kg<extra></extra>",
-            )
-        )
+        fig.add_trace(go.Scatter(
+            x=daily_f["date"],
+            y=daily_f["ma"],
+            mode="lines",
+            name=f"MA({ma_window}gg)",
+            hovertemplate="Giorno: %{x}<br>MA: %{y:.2f} kg<extra></extra>",
+        ))
 
     fig.add_hline(
         y=float(target_weight),
@@ -438,46 +449,41 @@ with tab_dash:
         annotation_position="bottom right",
     )
 
-    # FIX errore Timestamp: converti a datetime python via helper
-    safe_add_vline(
+    # ✅ evidenzia ultima misura senza usare add_vline (evita TypeError)
+    add_vline_robust(
         fig,
-        x=last_row["date"],
-        line_dash="dot",
-        annotation_text=f"Ultima misura ({last_row['date'].strftime('%d %b %H:%M')})",
-        annotation_position="top left",
+        x_dt=last_row["date"],
+        text=f"Ultima misura ({last_row['date'].strftime('%d %b %H:%M')})",
     )
 
-    # forecast (orizzonte selezionabile)
+    # Forecast (orizzonte)
     if model.get("ok", False) and len(daily_f) >= 2:
         last_dt = daily_f["date"].max()
         horizon_days = int(forecast_horizon)
+
         future_dates = pd.date_range(last_dt, last_dt + pd.Timedelta(days=horizon_days), freq="D")
         y_fore = [predict_weight(model, d) for d in future_dates]
 
-        fig.add_trace(
-            go.Scatter(
-                x=future_dates,
-                y=y_fore,
-                mode="lines",
-                name=f"Forecast ({horizon_days}g)",
-                line=dict(dash="dash"),
-                hovertemplate="Data: %{x}<br>Forecast: %{y:.2f} kg<extra></extra>",
-            )
-        )
+        fig.add_trace(go.Scatter(
+            x=future_dates,
+            y=y_fore,
+            mode="lines",
+            name=f"Forecast ({horizon_days}g)",
+            line=dict(dash="dash"),
+            hovertemplate="Data: %{x}<br>Forecast: %{y:.2f} kg<extra></extra>",
+        ))
 
-    # Punto forecast di domani (sempre relativo a "oggi")
+    # Punto forecast domani (rispetto a OGGI)
     if model.get("ok", False) and pred_tomorrow is not None:
-        fig.add_trace(
-            go.Scatter(
-                x=[tomorrow_ts.to_pydatetime()],
-                y=[pred_tomorrow],
-                mode="markers+text",
-                name="Forecast domani",
-                text=[f"{pred_tomorrow:.2f} kg"],
-                textposition="top center",
-                hovertemplate="Data: %{x}<br>Forecast: %{y:.2f} kg<extra></extra>",
-            )
-        )
+        fig.add_trace(go.Scatter(
+            x=[tomorrow_ts.to_pydatetime()],
+            y=[pred_tomorrow],
+            mode="markers+text",
+            name="Forecast domani",
+            text=[f"{pred_tomorrow:.2f} kg"],
+            textposition="top center",
+            hovertemplate="Data: %{x}<br>Forecast: %{y:.2f} kg<extra></extra>",
+        ))
 
     fig.update_layout(
         font=dict(size=11),
@@ -499,11 +505,7 @@ with tab_dash:
     last10["BMI"] = last10["bmi"].map(lambda x: f"{x:.2f}" if pd.notna(x) and np.isfinite(x) else "")
     last10["Origine"] = last10["source"]
 
-    st.dataframe(
-        last10[["Data", "Peso (kg)", "BMI", "Origine"]],
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.dataframe(last10[["Data", "Peso (kg)", "BMI", "Origine"]], use_container_width=True, hide_index=True)
 
 # -------------------------
 # MANUALE
@@ -526,14 +528,12 @@ with tab_manual:
                 float(m_weight) / (height_m**2) if height_m > 0 else np.nan
             )
 
-            new_row = pd.DataFrame(
-                [{
-                    "date": dt,
-                    "weight": float(m_weight),
-                    "bmi": bmi_val,
-                    "source": "manual",
-                }]
-            )
+            new_row = pd.DataFrame([{
+                "date": dt,
+                "weight": float(m_weight),
+                "bmi": bmi_val,
+                "source": "manual",
+            }])
 
             manual_now = load_manual()
             manual_now = pd.concat([manual_now, new_row], ignore_index=True)
@@ -572,7 +572,7 @@ with tab_manual:
             st.rerun()
 
 # -------------------------
-# FORECAST (sabati fino a target) — rimuovi sabati già passati rispetto a OGGI
+# FORECAST (sabati) — elimina quelli già passati rispetto a OGGI
 # -------------------------
 with tab_forecast:
     st.subheader("Forecast settimanale (sabati) fino al target")
@@ -596,13 +596,11 @@ with tab_forecast:
             while s <= target_date_est:
                 ts = ts_at_midnight(s)
                 w_pred = predict_weight(model, ts)
-                rows.append(
-                    {
-                        "Sabato": s.strftime("%d %b"),
-                        "Peso previsto (kg)": round(w_pred, 2),
-                        "Distanza dal target (kg)": round(w_pred - float(target_weight), 2),
-                    }
-                )
+                rows.append({
+                    "Sabato": s.strftime("%d %b"),
+                    "Peso previsto (kg)": round(w_pred, 2),
+                    "Distanza dal target (kg)": round(w_pred - float(target_weight), 2),
+                })
                 s += timedelta(days=7)
 
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
