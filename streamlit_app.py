@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from pathlib import Path
-from datetime import datetime, timedelta, date, time
+from datetime import datetime, timedelta, date, time as dtime
 
 # -------------------------
 # PAGE
@@ -15,7 +15,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Font globale ~ -1px
 st.markdown(
     """
     <style>
@@ -41,7 +40,7 @@ MANUAL_FILE = DATA_DIR / "manual_entries.csv"
 # HELPERS
 # -------------------------
 def ts_at_midnight(d: date) -> pd.Timestamp:
-    return pd.Timestamp(datetime.combine(d, time.min))
+    return pd.Timestamp(datetime.combine(d, dtime.min))
 
 def format_delta(value: float | None, decimals: int = 2) -> str | None:
     if value is None:
@@ -51,9 +50,17 @@ def format_delta(value: float | None, decimals: int = 2) -> str | None:
     return f"{value:+.{decimals}f}"
 
 def next_saturday(d: date) -> date:
-    # weekday(): Mon=0 ... Sat=5 ... Sun=6
-    days_ahead = (5 - d.weekday()) % 7
+    days_ahead = (5 - d.weekday()) % 7  # Sat=5
     return d + timedelta(days=days_ahead)
+
+def safe_add_vline(fig: go.Figure, x, **kwargs):
+    """
+    Fix per bug/compatibilità plotly+pandas Timestamp: add_vline prova a fare sum(x)
+    e scoppia con Timestamp. Converte a datetime python.
+    """
+    if isinstance(x, (pd.Timestamp, np.datetime64)):
+        x = pd.to_datetime(x).to_pydatetime()
+    fig.add_vline(x=x, **kwargs)
 
 # -------------------------
 # LOADERS
@@ -139,7 +146,7 @@ def make_daily_series(df: pd.DataFrame) -> pd.DataFrame:
     out["source"] = "daily"
     return out.sort_values("date").reset_index(drop=True)
 
-def pick_today_prefer_manual(df: pd.DataFrame) -> pd.Series:
+def pick_last_prefer_manual(df: pd.DataFrame) -> pd.Series:
     df = df.sort_values("date").copy()
     last_day = df["date"].dt.date.max()
     day_df = df[df["date"].dt.date == last_day].copy()
@@ -250,7 +257,7 @@ daily = make_daily_series(df)
 daily["ma"] = daily["weight"].rolling(ma_window, min_periods=1).mean()
 
 # -------------------------
-# DATE FILTER (INTERVALLO ANALISI) + GIORNO DI VISUALIZZAZIONE
+# DATE FILTER (INTERVALLO ANALISI)
 # -------------------------
 min_date = df["date"].min().date()
 max_date = df["date"].max().date()
@@ -267,12 +274,6 @@ if isinstance(date_range, tuple) and len(date_range) == 2:
 else:
     start_d, end_d = min_date, max_date
 
-# Giorno di visualizzazione corrente (fine intervallo selezionato)
-view_day = end_d
-view_day_ts = ts_at_midnight(view_day)
-next_view_day = view_day + timedelta(days=1)
-next_view_day_ts = ts_at_midnight(next_view_day)
-
 df_f = df[(df["date"].dt.date >= start_d) & (df["date"].dt.date <= end_d)].copy()
 daily_f = daily[(daily["date"].dt.date >= start_d) & (daily["date"].dt.date <= end_d)].copy()
 
@@ -283,9 +284,16 @@ if df_f.empty:
 daily_f["ma"] = daily_f["weight"].rolling(ma_window, min_periods=1).mean()
 
 # -------------------------
-# CURRENT "LAST" (prefer manual today) within filtered data
+# "OGGI" REALE (si aggiorna ogni giorno)
 # -------------------------
-last_row = pick_today_prefer_manual(df_f)
+today = date.today()
+tomorrow = today + timedelta(days=1)
+tomorrow_ts = ts_at_midnight(tomorrow)
+
+# -------------------------
+# CURRENT "LAST" (prefer manual for last day in filtered data)
+# -------------------------
+last_row = pick_last_prefer_manual(df_f)
 last_day = last_row["date"].date()
 last_weight = float(last_row["weight"])
 last_bmi = float(last_row["bmi"]) if pd.notna(last_row["bmi"]) else np.nan
@@ -318,19 +326,19 @@ if model.get("ok", False) and prevent_upward_forecast and model["m"] > 0:
     model = dict(model)
     model["m"] = 0.0
 
-# stima data target
+# stima data target (riferita a "today" come riferimento umano)
 target_date_est = None
 days_to_target = None
 if model.get("ok", False) and model["m"] < 0:
     x_target = (float(target_weight) - model["b"]) / model["m"]
     if np.isfinite(x_target) and x_target >= 0:
         target_date_est = (model["t0"] + pd.Timedelta(days=float(x_target))).date()
-        days_to_target = (target_date_est - view_day).days
+        days_to_target = (target_date_est - today).days
 
-# forecast del giorno successivo al giorno di visualizzazione
-pred_next_view_day = None
+# forecast del giorno successivo a "oggi" (sempre, anche se non inserisco misure)
+pred_tomorrow = None
 if model.get("ok", False):
-    pred_next_view_day = predict_weight(model, next_view_day_ts)
+    pred_tomorrow = predict_weight(model, tomorrow_ts)
 
 # -------------------------
 # TABS
@@ -377,13 +385,13 @@ with tab_dash:
     c5.metric(
         "Data target stimata",
         target_date_est.strftime("%d %b") if target_date_est else "—",
-        (f"{days_to_target} giorni (da {view_day.strftime('%d %b')})") if days_to_target is not None else "—",
+        (f"{days_to_target} giorni (da oggi)") if days_to_target is not None else "—",
     )
 
     c6.metric(
-        f"Forecast {next_view_day.strftime('%d %b')}",
-        f"{pred_next_view_day:.2f} kg" if pred_next_view_day is not None else "—",
-        f"giorno successivo a {view_day.strftime('%d %b')}",
+        f"Forecast {tomorrow.strftime('%d %b')}",
+        f"{pred_tomorrow:.2f} kg" if pred_tomorrow is not None else "—",
+        "giorno successivo a oggi",
     )
 
     st.markdown("---")
@@ -423,7 +431,6 @@ with tab_dash:
             )
         )
 
-    # Target line
     fig.add_hline(
         y=float(target_weight),
         line_dash="dash",
@@ -431,15 +438,16 @@ with tab_dash:
         annotation_position="bottom right",
     )
 
-    # Evidenzia l'istante dell'ultima misura (vertical line)
-    fig.add_vline(
+    # FIX errore Timestamp: converti a datetime python via helper
+    safe_add_vline(
+        fig,
         x=last_row["date"],
         line_dash="dot",
         annotation_text=f"Ultima misura ({last_row['date'].strftime('%d %b %H:%M')})",
         annotation_position="top left",
     )
 
-    # Forecast (orizzonte selezionabile)
+    # forecast (orizzonte selezionabile)
     if model.get("ok", False) and len(daily_f) >= 2:
         last_dt = daily_f["date"].max()
         horizon_days = int(forecast_horizon)
@@ -457,15 +465,15 @@ with tab_dash:
             )
         )
 
-    # Punto forecast del giorno successivo al giorno visualizzato
-    if model.get("ok", False) and pred_next_view_day is not None:
+    # Punto forecast di domani (sempre relativo a "oggi")
+    if model.get("ok", False) and pred_tomorrow is not None:
         fig.add_trace(
             go.Scatter(
-                x=[next_view_day_ts],
-                y=[pred_next_view_day],
+                x=[tomorrow_ts.to_pydatetime()],
+                y=[pred_tomorrow],
                 mode="markers+text",
-                name="Forecast giorno successivo",
-                text=[f"{pred_next_view_day:.2f} kg"],
+                name="Forecast domani",
+                text=[f"{pred_tomorrow:.2f} kg"],
                 textposition="top center",
                 hovertemplate="Data: %{x}<br>Forecast: %{y:.2f} kg<extra></extra>",
             )
@@ -514,7 +522,9 @@ with tab_manual:
         submitted = st.form_submit_button("✅ Salva", use_container_width=True)
         if submitted:
             dt = pd.Timestamp(datetime.combine(m_date, m_time))
-            bmi_val = float(m_bmi) if float(m_bmi) > 0 else (float(m_weight) / (height_m**2) if height_m > 0 else np.nan)
+            bmi_val = float(m_bmi) if float(m_bmi) > 0 else (
+                float(m_weight) / (height_m**2) if height_m > 0 else np.nan
+            )
 
             new_row = pd.DataFrame(
                 [{
@@ -562,7 +572,7 @@ with tab_manual:
             st.rerun()
 
 # -------------------------
-# FORECAST (sabati fino a target) — rimuovi sabati già passati rispetto al view_day
+# FORECAST (sabati fino a target) — rimuovi sabati già passati rispetto a OGGI
 # -------------------------
 with tab_forecast:
     st.subheader("Forecast settimanale (sabati) fino al target")
@@ -572,9 +582,8 @@ with tab_forecast:
     elif not target_date_est:
         st.warning("Data target non stimabile: non posso calcolare i sabati fino al target.")
     else:
-        # Parti dal prossimo sabato rispetto al GIORNO DI VISUALIZZAZIONE, non rispetto all'ultima misura
-        start_sat = next_saturday(view_day)
-        if start_sat <= view_day:
+        start_sat = next_saturday(today)
+        if start_sat <= today:
             start_sat = start_sat + timedelta(days=7)
 
         if target_date_est < start_sat:
