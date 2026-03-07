@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import sqlite3
 from pathlib import Path
 from datetime import datetime, timedelta, date, time as dtime
 
@@ -32,9 +33,11 @@ DEFAULT_BASELINE_WEIGHT = 112.0
 DEFAULT_TARGET_WEIGHT = 72.0
 DEFAULT_HEIGHT_M = 1.82
 
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
-MANUAL_FILE = DATA_DIR / "manual_entries.csv"
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+DB_FILE = DATA_DIR / "manual_entries.db"
 
 # -------------------------
 # HELPERS
@@ -54,10 +57,6 @@ def next_saturday(d: date) -> date:
     return d + timedelta(days=days_ahead)
 
 def add_vline_robust(fig: go.Figure, x_dt, text: str):
-    """
-    Plotly add_vline con annotation su datetime può generare TypeError (sum su datetime).
-    Soluzione: usa shapes+annotations (robusto).
-    """
     x_py = pd.to_datetime(x_dt).to_pydatetime()
     fig.add_shape(
         type="line",
@@ -80,6 +79,91 @@ def add_vline_robust(fig: go.Figure, x_dt, text: str):
         yanchor="bottom",
         yshift=6,
     )
+
+# -------------------------
+# SQLITE
+# -------------------------
+def get_conn():
+    return sqlite3.connect(DB_FILE, check_same_thread=False)
+
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS manual_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            weight REAL NOT NULL,
+            bmi REAL,
+            source TEXT NOT NULL DEFAULT 'manual'
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+def load_manual() -> pd.DataFrame:
+    init_db()
+    conn = get_conn()
+    df = pd.read_sql_query(
+        """
+        SELECT id, date, weight, bmi, source
+        FROM manual_entries
+        ORDER BY date
+        """,
+        conn
+    )
+    conn.close()
+
+    if df.empty:
+        return pd.DataFrame(columns=["id", "date", "weight", "bmi", "source"])
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["weight"] = pd.to_numeric(df["weight"], errors="coerce")
+    df["bmi"] = pd.to_numeric(df["bmi"], errors="coerce")
+    df["source"] = "manual"
+
+    df = df.dropna(subset=["date", "weight"])
+    return df.sort_values("date").reset_index(drop=True)
+
+def insert_manual_entry(dt: pd.Timestamp, weight: float, bmi: float | None):
+    init_db()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO manual_entries (date, weight, bmi, source)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            pd.Timestamp(dt).isoformat(),
+            float(weight),
+            float(bmi) if bmi is not None and pd.notna(bmi) else None,
+            "manual",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+def delete_manual_entries_by_id(ids: list[int]):
+    if not ids:
+        return
+    init_db()
+    conn = get_conn()
+    cur = conn.cursor()
+    placeholders = ",".join(["?"] * len(ids))
+    cur.execute(f"DELETE FROM manual_entries WHERE id IN ({placeholders})", ids)
+    conn.commit()
+    conn.close()
+
+def clear_manual_entries():
+    init_db()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM manual_entries")
+    conn.commit()
+    conn.close()
 
 # -------------------------
 # LOADERS
@@ -113,26 +197,15 @@ def load_renpho_csv(url: str) -> pd.DataFrame:
 
     df["source"] = "renpho"
     df["bmi"] = np.nan
-    return df
-
-def load_manual() -> pd.DataFrame:
-    if not MANUAL_FILE.exists():
-        return pd.DataFrame(columns=["date", "weight", "bmi", "source"])
-    df = pd.read_csv(MANUAL_FILE)
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["weight"] = pd.to_numeric(df["weight"], errors="coerce")
-    df["bmi"] = pd.to_numeric(df["bmi"], errors="coerce")
-    df["source"] = "manual"
-    df = df.dropna(subset=["date"])
-    df = df.sort_values("date").drop_duplicates(subset=["date"], keep="last")
-    return df
-
-def save_manual(df: pd.DataFrame) -> None:
-    out = df.copy()
-    out = out.sort_values("date").drop_duplicates(subset=["date"], keep="last")
-    out.to_csv(MANUAL_FILE, index=False)
+    return df.reset_index(drop=True)
 
 def combine_data(renpho_df: pd.DataFrame, manual_df: pd.DataFrame) -> pd.DataFrame:
+    renpho_df = renpho_df.copy()
+    manual_df = manual_df.copy()
+
+    if "id" not in renpho_df.columns:
+        renpho_df["id"] = np.nan
+
     if manual_df.empty:
         df = renpho_df.copy()
     else:
@@ -141,6 +214,7 @@ def combine_data(renpho_df: pd.DataFrame, manual_df: pd.DataFrame) -> pd.DataFra
         df["__prio"] = df["source"].map({"renpho": 0, "manual": 1}).fillna(0)
         df = df.sort_values(["date", "__prio"]).drop(columns=["__prio"])
         df = df.drop_duplicates(subset=["date"], keep="last")
+
     return df.sort_values("date").reset_index(drop=True)
 
 # -------------------------
@@ -175,7 +249,7 @@ def pick_last_prefer_manual(df: pd.DataFrame) -> pd.Series:
     return day_df.sort_values("date").iloc[-1]
 
 # -------------------------
-# MODEL (stabilizzato)
+# MODEL
 # -------------------------
 def fit_linear_model(daily_df: pd.DataFrame, lookback_days: int) -> dict:
     if daily_df.empty or len(daily_df) < 2:
@@ -244,6 +318,8 @@ with st.sidebar:
     prevent_upward_forecast = st.toggle("Blocca forecast crescente", value=True)
 
     st.divider()
+    st.caption(f"DB manuale: {DB_FILE}")
+
     if st.button("🔄 Forza refresh RENPHO", use_container_width=True):
         load_renpho_csv.clear()
         st.rerun()
@@ -296,14 +372,14 @@ if df_f.empty:
 daily_f["ma"] = daily_f["weight"].rolling(ma_window, min_periods=1).mean()
 
 # -------------------------
-# OGGI + DOMANI (sempre)
+# OGGI + DOMANI
 # -------------------------
 today = date.today()
 tomorrow = today + timedelta(days=1)
 tomorrow_ts = ts_at_midnight(tomorrow)
 
 # -------------------------
-# LAST & PREVIOUS MEASURE (vs ultima misura)
+# LAST & PREVIOUS MEASURE
 # -------------------------
 last_row = pick_last_prefer_manual(df_f)
 last_dt = pd.to_datetime(last_row["date"])
@@ -334,7 +410,7 @@ else:
     delta_loss, delta_dist = None, None
 
 # -------------------------
-# MODEL + FORECAST (domani rispetto a oggi)
+# MODEL + FORECAST
 # -------------------------
 model = fit_linear_model(daily_f, lookback_days=lookback_days)
 
@@ -516,19 +592,9 @@ with tab_manual:
                 float(m_weight) / (height_m**2) if height_m > 0 else np.nan
             )
 
-            new_row = pd.DataFrame([{
-                "date": dt,
-                "weight": float(m_weight),
-                "bmi": bmi_val,
-                "source": "manual",
-            }])
+            insert_manual_entry(dt, float(m_weight), bmi_val)
 
-            manual_now = load_manual()
-            manual_now = pd.concat([manual_now, new_row], ignore_index=True)
-            manual_now = manual_now.sort_values("date").drop_duplicates(subset=["date"], keep="last")
-            save_manual(manual_now)
-
-            st.success("Misura salvata. Aggiorno…")
+            st.success("Misura manuale salvata nel database.")
             load_renpho_csv.clear()
             st.rerun()
 
@@ -540,27 +606,49 @@ with tab_manual:
         st.info("Nessuna misura manuale salvata.")
     else:
         tmp = manual_now.copy()
-        tmp["date_str"] = tmp["date"].dt.strftime("%Y-%m-%d %H:%M")
-        to_delete = st.multiselect("Seleziona i record da cancellare", options=tmp["date_str"].tolist())
+        tmp["label"] = (
+            tmp["date"].dt.strftime("%Y-%m-%d %H:%M")
+            + " | "
+            + tmp["weight"].map(lambda x: f"{x:.2f} kg")
+        )
+
+        selected_labels = st.multiselect(
+            "Seleziona i record da cancellare",
+            options=tmp["label"].tolist()
+        )
+
+        selected_ids = tmp.loc[tmp["label"].isin(selected_labels), "id"].astype(int).tolist()
 
         col1, col2 = st.columns(2)
+
         if col1.button("🗑️ Cancella selezionate", use_container_width=True, type="primary"):
-            if to_delete:
-                keep = ~tmp["date_str"].isin(to_delete)
-                manual_new = tmp.loc[keep, ["date", "weight", "bmi", "source"]].copy()
-                save_manual(manual_new)
-                st.success("Cancellate. Aggiorno…")
+            if selected_ids:
+                delete_manual_entries_by_id(selected_ids)
+                st.success("Misure selezionate cancellate.")
                 st.rerun()
             else:
                 st.warning("Seleziona almeno un record.")
 
         if col2.button("⚠️ Cancella TUTTO", use_container_width=True):
-            save_manual(pd.DataFrame(columns=["date", "weight", "bmi", "source"]))
-            st.success("Manuale azzerato. Aggiorno…")
+            clear_manual_entries()
+            st.success("Archivio manuale azzerato.")
             st.rerun()
 
+        st.markdown("---")
+        st.subheader("Archivio misure manuali")
+
+        show_manual = tmp.sort_values("date", ascending=False).copy()
+        show_manual["Data"] = show_manual["date"].dt.strftime("%Y-%m-%d %H:%M")
+        show_manual["Peso (kg)"] = show_manual["weight"].map(lambda x: f"{x:.2f}")
+        show_manual["BMI"] = show_manual["bmi"].map(lambda x: f"{x:.2f}" if pd.notna(x) and np.isfinite(x) else "")
+        st.dataframe(
+            show_manual[["Data", "Peso (kg)", "BMI", "source"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
 # -------------------------
-# FORECAST (sabati) — elimina quelli già passati rispetto a OGGI
+# FORECAST
 # -------------------------
 with tab_forecast:
     st.subheader("Forecast settimanale (sabati) fino al target")
