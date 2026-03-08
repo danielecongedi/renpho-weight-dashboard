@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from supabase import create_client, Client
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from datetime import datetime, timedelta, date, time as dtime
 
 # -------------------------
@@ -95,10 +96,8 @@ def load_manual() -> pd.DataFrame:
     df["weight"] = pd.to_numeric(df["weight"], errors="coerce")
     df["bmi"] = pd.to_numeric(df["bmi"], errors="coerce")
     df["source"] = df["source"].fillna("manual")
-
     df = df.dropna(subset=["date", "weight"])
-    df = df.sort_values("date").reset_index(drop=True)
-    return df
+    return df.sort_values("date").reset_index(drop=True)
 
 def insert_manual_entry(dt: pd.Timestamp, weight: float, bmi: float | None):
     supabase = get_supabase()
@@ -127,7 +126,6 @@ def clear_manual_entries():
 def load_renpho_csv(url: str) -> pd.DataFrame:
     raw = pd.read_csv(url, header=None)
 
-    # spesso è 1 colonna unica -> split
     if raw.shape[1] == 1:
         s = raw[0].astype(str).str.strip()
         s = s.str.replace(r'^"|"$', "", regex=True)
@@ -166,7 +164,6 @@ def combine_data(renpho_df: pd.DataFrame, manual_df: pd.DataFrame) -> pd.DataFra
         df = renpho_df.copy()
     else:
         df = pd.concat([renpho_df, manual_df], ignore_index=True)
-        # priorità manual in caso di stesso timestamp
         df["__prio"] = df["source"].map({"renpho": 0, "manual": 1}).fillna(0)
         df = df.sort_values(["date", "__prio"]).drop(columns=["__prio"])
         df = df.drop_duplicates(subset=["date"], keep="last")
@@ -205,40 +202,159 @@ def pick_last_prefer_manual(df: pd.DataFrame) -> pd.Series:
     return day_df.sort_values("date").iloc[-1]
 
 # -------------------------
-# MODEL (stabilizzato)
+# FORECAST MODEL
 # -------------------------
-def fit_linear_model(daily_df: pd.DataFrame, lookback_days: int) -> dict:
-    if daily_df.empty or len(daily_df) < 2:
-        return {"ok": False, "reason": "no_data"}
+def fit_best_forecast_model(
+    daily_df: pd.DataFrame,
+    lookback_days: int = 90,
+    smoothing_window: int = 7,
+) -> dict:
+    if daily_df.empty or len(daily_df) < 10:
+        return {"ok": False, "reason": "too_few_points"}
 
-    end = daily_df["date"].max()
+    df = daily_df.sort_values("date").copy()
+
+    end = df["date"].max()
     start = end - pd.Timedelta(days=lookback_days)
-    sub = daily_df[daily_df["date"] >= start].copy()
-    if len(sub) < 2:
-        sub = daily_df.copy()
+    sub = df[df["date"] >= start].copy()
+    if len(sub) < 10:
+        sub = df.copy()
 
-    if len(sub) < 7:
-        return {"ok": False, "reason": f"too_few_points ({len(sub)})"}
+    sub = sub.sort_values("date").reset_index(drop=True)
 
-    t0 = sub["date"].min()
-    x = (sub["date"] - t0).dt.total_seconds().values / 86400.0
-    y = sub["weight"].values
+    # indice giornaliero continuo
+    full_idx = pd.date_range(sub["date"].min().normalize(), sub["date"].max().normalize(), freq="D")
+    s = sub.set_index(sub["date"].dt.normalize())["weight"].reindex(full_idx)
 
-    A = np.vstack([x, np.ones(len(x))]).T
-    m, b = np.linalg.lstsq(A, y, rcond=None)[0]
-    m = float(m)
-    b = float(b)
+    # interpolazione giorni mancanti
+    s = s.interpolate(method="time").ffill().bfill()
 
-    # clamp ±2 kg/settimana
-    max_week = 2.0
-    if abs(m * 7.0) > max_week:
-        m = np.sign(m) * (max_week / 7.0)
+    # smoothing per ridurre rumore giornaliero
+    s_smooth = s.rolling(window=smoothing_window, min_periods=1).mean()
 
-    return {"ok": True, "m": m, "b": b, "t0": t0, "sub": sub}
+    if len(s_smooth) < 10:
+        return {"ok": False, "reason": "too_few_smoothed_points"}
 
-def predict_weight(model: dict, when: pd.Timestamp) -> float:
-    x = (when - model["t0"]).total_seconds() / 86400.0
-    return float(model["m"] * x + model["b"])
+    try:
+        model = ExponentialSmoothing(
+            s_smooth,
+            trend="add",
+            seasonal=None,
+            damped_trend=True,
+            initialization_method="estimated",
+        ).fit(optimized=True, use_brute=True)
+
+        fitted = model.fittedvalues
+        residuals = (s_smooth - fitted).dropna()
+        resid_std = float(residuals.std()) if len(residuals) > 1 else 0.0
+
+        # slope recente per controllo realismo
+        recent = s_smooth.tail(min(21, len(s_smooth)))
+        x = np.arange(len(recent), dtype=float)
+        y = recent.values.astype(float)
+        A = np.vstack([x, np.ones(len(x))]).T
+        slope, intercept = np.linalg.lstsq(A, y, rcond=None)[0]
+        slope = float(slope)
+
+        # clamp prudenziale max ±2kg/settimana
+        max_daily_realistic = 2.0 / 7.0
+        slope = float(np.clip(slope, -max_daily_realistic, max_daily_realistic))
+
+        return {
+            "ok": True,
+            "type": "holt_damped",
+            "model": model,
+            "series": s_smooth,
+            "last_date": s_smooth.index.max(),
+            "last_weight": float(s_smooth.iloc[-1]),
+            "recent_slope": slope,
+            "resid_std": resid_std,
+        }
+
+    except Exception as e:
+        # fallback robusto
+        recent = s_smooth.tail(min(21, len(s_smooth)))
+        x = np.arange(len(recent), dtype=float)
+        y = recent.values.astype(float)
+        A = np.vstack([x, np.ones(len(x))]).T
+        slope, intercept = np.linalg.lstsq(A, y, rcond=None)[0]
+        slope = float(slope)
+
+        max_daily_realistic = 2.0 / 7.0
+        slope = float(np.clip(slope, -max_daily_realistic, max_daily_realistic))
+
+        return {
+            "ok": True,
+            "type": "fallback_trend",
+            "last_date": recent.index.max(),
+            "last_weight": float(recent.iloc[-1]),
+            "recent_slope": slope,
+            "resid_std": 0.25,
+            "fallback_reason": str(e),
+        }
+
+def forecast_series(model_dict: dict, start_date: pd.Timestamp, horizon_days: int) -> tuple[pd.DatetimeIndex, list[float]]:
+    if not model_dict.get("ok", False):
+        return pd.DatetimeIndex([]), []
+
+    start_date = pd.to_datetime(start_date).normalize()
+    future_dates = pd.date_range(start_date, start_date + pd.Timedelta(days=horizon_days), freq="D")
+
+    if model_dict["type"] == "holt_damped":
+        model = model_dict["model"]
+        last_train_date = pd.to_datetime(model_dict["last_date"]).normalize()
+
+        days_from_train_end = (future_dates[-1] - last_train_date).days
+        days_from_train_end = max(days_from_train_end, 0)
+
+        fc = model.forecast(days_from_train_end)
+        fc_idx = pd.date_range(last_train_date + pd.Timedelta(days=1), periods=len(fc), freq="D")
+        fc_series = pd.Series(fc.values, index=fc_idx)
+
+        values = []
+        for d in future_dates:
+            if d <= last_train_date:
+                values.append(float(model_dict["last_weight"]))
+            else:
+                values.append(float(fc_series.loc[d]))
+        return future_dates, values
+
+    # fallback trend smorzato
+    weight = float(model_dict["last_weight"])
+    delta = float(model_dict["recent_slope"])
+    damping = 0.985
+
+    values = []
+    for i, d in enumerate(future_dates):
+        if i == 0:
+            values.append(weight)
+        else:
+            weight += delta
+            delta *= damping
+            values.append(float(weight))
+    return future_dates, values
+
+def predict_weight(model_dict: dict, when: pd.Timestamp) -> float:
+    when = pd.to_datetime(when).normalize()
+    dates, values = forecast_series(model_dict, start_date=when, horizon_days=0)
+    if len(values) == 0:
+        return np.nan
+    return float(values[0])
+
+def estimate_target_date(model_dict: dict, target_weight: float, start_from: date, max_horizon_days: int = 365) -> tuple[date | None, int | None]:
+    start_ts = pd.Timestamp(start_from)
+    dates, values = forecast_series(model_dict, start_date=start_ts, horizon_days=max_horizon_days)
+
+    if len(values) == 0:
+        return None, None
+
+    for d, w in zip(dates, values):
+        if w <= float(target_weight):
+            target_date = pd.to_datetime(d).date()
+            days_to_target = (target_date - start_from).days
+            return target_date, days_to_target
+
+    return None, None
 
 # -------------------------
 # SECRETS
@@ -266,8 +382,9 @@ with st.sidebar:
     height_m = st.number_input("📏 Altezza (m) per BMI", value=float(DEFAULT_HEIGHT_M), step=0.01)
 
     st.divider()
-    lookback_days = st.selectbox("🔍 Finestra modello (giorni)", [30, 45, 60, 90, 120, 180], index=2)
-    ma_window = st.selectbox("📈 Media mobile (giorni)", [7, 14, 21, 30], index=0)
+    lookback_days = st.selectbox("🔍 Finestra modello (giorni)", [30, 45, 60, 90, 120, 180], index=3)
+    ma_window = st.selectbox("📈 Media mobile visuale (giorni)", [7, 14, 21, 30], index=0)
+    forecast_smoothing = st.selectbox("🧠 Smoothing forecast", [3, 5, 7, 10], index=2)
 
     st.divider()
     forecast_horizon = st.selectbox("⏳ Orizzonte forecast (giorni)", [30, 60, 90, 180], index=1)
@@ -335,7 +452,7 @@ if df_f.empty:
 daily_f["ma"] = daily_f["weight"].rolling(ma_window, min_periods=1).mean()
 
 # -------------------------
-# OGGI + DOMANI (sempre)
+# OGGI + DOMANI
 # -------------------------
 today = date.today()
 tomorrow = today + timedelta(days=1)
@@ -358,7 +475,6 @@ if prev_row is not None:
 else:
     prev_weight, prev_bmi = None, None
 
-delta_w = (last_weight - prev_weight) if prev_weight is not None else None
 delta_bmi = (last_bmi - prev_bmi) if (prev_bmi is not None and np.isfinite(last_bmi) and np.isfinite(prev_bmi)) else None
 
 loss_from_baseline = float(baseline_weight - last_weight)
@@ -375,23 +491,32 @@ else:
 # -------------------------
 # MODEL + FORECAST
 # -------------------------
-model = fit_linear_model(daily_f, lookback_days=lookback_days)
+model = fit_best_forecast_model(
+    daily_f,
+    lookback_days=lookback_days,
+    smoothing_window=forecast_smoothing,
+)
 
-if model.get("ok", False) and prevent_upward_forecast and model["m"] > 0:
-    model = dict(model)
-    model["m"] = 0.0
+if model.get("ok", False) and prevent_upward_forecast:
+    if model["type"] == "holt_damped" and model.get("recent_slope", 0) > 0:
+        model = dict(model)
+        model["recent_slope"] = 0.0
+    elif model["type"] == "fallback_trend" and model.get("recent_slope", 0) > 0:
+        model = dict(model)
+        model["recent_slope"] = 0.0
 
 pred_tomorrow = None
 if model.get("ok", False):
-    pred_tomorrow = predict_weight(model, tomorrow_ts)
+    tmp_dates, tmp_values = forecast_series(model, start_date=tomorrow_ts, horizon_days=0)
+    if len(tmp_values) > 0:
+        pred_tomorrow = float(tmp_values[0])
 
-target_date_est = None
-days_to_target = None
-if model.get("ok", False) and model["m"] < 0:
-    x_target = (float(target_weight) - model["b"]) / model["m"]
-    if np.isfinite(x_target) and x_target >= 0:
-        target_date_est = (model["t0"] + pd.Timedelta(days=float(x_target))).date()
-        days_to_target = (target_date_est - today).days
+target_date_est, days_to_target = estimate_target_date(
+    model,
+    target_weight=float(target_weight),
+    start_from=today,
+    max_horizon_days=365,
+) if model.get("ok", False) else (None, None)
 
 # -------------------------
 # TABS
@@ -444,11 +569,11 @@ with tab_dash:
     c6.metric(
         f"Forecast {tomorrow.strftime('%d %b')}",
         f"{pred_tomorrow:.2f} kg" if pred_tomorrow is not None else "—",
-        "giorno successivo a oggi",
+        "modello Holt smorzato",
     )
 
     st.markdown("---")
-    st.subheader("Trend peso + forecasting (modello su DAILY)")
+    st.subheader("Trend peso + forecasting")
 
     fig = go.Figure()
 
@@ -488,10 +613,13 @@ with tab_dash:
     )
 
     if model.get("ok", False) and len(daily_f) >= 2:
-        last_daily_dt = daily_f["date"].max()
+        last_daily_dt = daily_f["date"].max().normalize()
         horizon_days = int(forecast_horizon)
-        future_dates = pd.date_range(last_daily_dt, last_daily_dt + pd.Timedelta(days=horizon_days), freq="D")
-        y_fore = [predict_weight(model, d) for d in future_dates]
+        future_dates, y_fore = forecast_series(
+            model,
+            start_date=last_daily_dt,
+            horizon_days=horizon_days,
+        )
 
         fig.add_trace(go.Scatter(
             x=future_dates, y=y_fore,
@@ -501,7 +629,7 @@ with tab_dash:
             hovertemplate="Data: %{x}<br>Forecast: %{y:.2f} kg<extra></extra>",
         ))
 
-    if model.get("ok", False) and pred_tomorrow is not None:
+    if pred_tomorrow is not None:
         fig.add_trace(go.Scatter(
             x=[tomorrow_ts.to_pydatetime()],
             y=[pred_tomorrow],
@@ -557,7 +685,6 @@ with tab_manual:
                 )
 
                 insert_manual_entry(dt, float(m_weight), bmi_val)
-
                 st.success("Misura salvata in modo permanente.")
                 st.rerun()
             except Exception as e:
@@ -628,7 +755,7 @@ with tab_forecast:
     if not model.get("ok", False):
         st.warning("Modello non disponibile (pochi punti o dati insufficienti).")
     elif not target_date_est:
-        st.warning("Data target non stimabile: non posso calcolare i sabati fino al target.")
+        st.warning("Data target non stimabile entro 365 giorni.")
     else:
         start_sat = next_saturday(today)
         if start_sat <= today:
@@ -643,7 +770,9 @@ with tab_forecast:
             s = start_sat
             while s <= target_date_est:
                 ts = ts_at_midnight(s)
-                w_pred = predict_weight(model, ts)
+                future_dates, future_vals = forecast_series(model, start_date=ts, horizon_days=0)
+                w_pred = float(future_vals[0]) if len(future_vals) > 0 else np.nan
+
                 rows.append({
                     "Sabato": s.strftime("%d %b"),
                     "Peso previsto (kg)": round(w_pred, 2),
@@ -652,6 +781,13 @@ with tab_forecast:
                 s += timedelta(days=7)
 
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        if model["type"] == "holt_damped":
+            st.caption(
+                f"Modello usato: Holt con trend smorzato | volatilità residua stimata: {model.get('resid_std', 0):.2f} kg"
+            )
+        else:
+            st.caption("Modello usato: fallback trend smorzato")
 
 # -------------------------
 # DATASET
