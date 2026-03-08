@@ -2,8 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import sqlite3
-from pathlib import Path
+from supabase import create_client, Client
 from datetime import datetime, timedelta, date, time as dtime
 
 # -------------------------
@@ -32,12 +31,6 @@ DEFAULT_BASELINE_DATE = date(2026, 8, 1)
 DEFAULT_BASELINE_WEIGHT = 112.0
 DEFAULT_TARGET_WEIGHT = 72.0
 DEFAULT_HEIGHT_M = 1.82
-
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-DB_FILE = DATA_DIR / "manual_entries.db"
 
 # -------------------------
 # HELPERS
@@ -81,89 +74,51 @@ def add_vline_robust(fig: go.Figure, x_dt, text: str):
     )
 
 # -------------------------
-# SQLITE
+# SUPABASE
 # -------------------------
-def get_conn():
-    return sqlite3.connect(DB_FILE, check_same_thread=False)
-
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS manual_entries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT NOT NULL,
-            weight REAL NOT NULL,
-            bmi REAL,
-            source TEXT NOT NULL DEFAULT 'manual'
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
+@st.cache_resource
+def get_supabase() -> Client:
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
 
 def load_manual() -> pd.DataFrame:
-    init_db()
-    conn = get_conn()
-    df = pd.read_sql_query(
-        """
-        SELECT id, date, weight, bmi, source
-        FROM manual_entries
-        ORDER BY date
-        """,
-        conn
-    )
-    conn.close()
+    supabase = get_supabase()
+    res = supabase.table("manual_entries").select("*").order("date").execute()
+    rows = res.data if res.data else []
 
-    if df.empty:
+    if not rows:
         return pd.DataFrame(columns=["id", "date", "weight", "bmi", "source"])
 
+    df = pd.DataFrame(rows)
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["weight"] = pd.to_numeric(df["weight"], errors="coerce")
     df["bmi"] = pd.to_numeric(df["bmi"], errors="coerce")
-    df["source"] = "manual"
+    df["source"] = df["source"].fillna("manual")
 
     df = df.dropna(subset=["date", "weight"])
-    return df.sort_values("date").reset_index(drop=True)
+    df = df.sort_values("date").reset_index(drop=True)
+    return df
 
 def insert_manual_entry(dt: pd.Timestamp, weight: float, bmi: float | None):
-    init_db()
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO manual_entries (date, weight, bmi, source)
-        VALUES (?, ?, ?, ?)
-        """,
-        (
-            pd.Timestamp(dt).isoformat(),
-            float(weight),
-            float(bmi) if bmi is not None and pd.notna(bmi) else None,
-            "manual",
-        ),
-    )
-    conn.commit()
-    conn.close()
+    supabase = get_supabase()
+    payload = {
+        "date": pd.Timestamp(dt).isoformat(),
+        "weight": float(weight),
+        "bmi": float(bmi) if bmi is not None and pd.notna(bmi) else None,
+        "source": "manual",
+    }
+    supabase.table("manual_entries").insert(payload).execute()
 
 def delete_manual_entries_by_id(ids: list[int]):
     if not ids:
         return
-    init_db()
-    conn = get_conn()
-    cur = conn.cursor()
-    placeholders = ",".join(["?"] * len(ids))
-    cur.execute(f"DELETE FROM manual_entries WHERE id IN ({placeholders})", ids)
-    conn.commit()
-    conn.close()
+    supabase = get_supabase()
+    supabase.table("manual_entries").delete().in_("id", ids).execute()
 
 def clear_manual_entries():
-    init_db()
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM manual_entries")
-    conn.commit()
-    conn.close()
+    supabase = get_supabase()
+    supabase.table("manual_entries").delete().neq("id", 0).execute()
 
 # -------------------------
 # LOADERS
@@ -197,6 +152,7 @@ def load_renpho_csv(url: str) -> pd.DataFrame:
 
     df["source"] = "renpho"
     df["bmi"] = np.nan
+    df["id"] = np.nan
     return df.reset_index(drop=True)
 
 def combine_data(renpho_df: pd.DataFrame, manual_df: pd.DataFrame) -> pd.DataFrame:
@@ -249,7 +205,7 @@ def pick_last_prefer_manual(df: pd.DataFrame) -> pd.Series:
     return day_df.sort_values("date").iloc[-1]
 
 # -------------------------
-# MODEL
+# MODEL (stabilizzato)
 # -------------------------
 def fit_linear_model(daily_df: pd.DataFrame, lookback_days: int) -> dict:
     if daily_df.empty or len(daily_df) < 2:
@@ -292,6 +248,10 @@ if not csv_url:
     st.error("CSV_URL non impostato. Mettilo nei Secrets.")
     st.stop()
 
+if "SUPABASE_URL" not in st.secrets or "SUPABASE_KEY" not in st.secrets:
+    st.error("SUPABASE_URL o SUPABASE_KEY mancanti nei Secrets.")
+    st.stop()
+
 # -------------------------
 # SIDEBAR
 # -------------------------
@@ -318,8 +278,6 @@ with st.sidebar:
     prevent_upward_forecast = st.toggle("Blocca forecast crescente", value=True)
 
     st.divider()
-    st.caption(f"DB manuale: {DB_FILE}")
-
     if st.button("🔄 Forza refresh RENPHO", use_container_width=True):
         load_renpho_csv.clear()
         st.rerun()
@@ -333,7 +291,12 @@ except Exception as e:
     st.error(f"Errore caricamento RENPHO: {e}")
     st.stop()
 
-manual = load_manual()
+try:
+    manual = load_manual()
+except Exception as e:
+    st.error(f"Errore caricamento dati manuali da Supabase: {e}")
+    st.stop()
+
 df = combine_data(renpho, manual)
 df = add_bmi_if_missing(df, height_m)
 
@@ -372,7 +335,7 @@ if df_f.empty:
 daily_f["ma"] = daily_f["weight"].rolling(ma_window, min_periods=1).mean()
 
 # -------------------------
-# OGGI + DOMANI
+# OGGI + DOMANI (sempre)
 # -------------------------
 today = date.today()
 tomorrow = today + timedelta(days=1)
@@ -587,16 +550,18 @@ with tab_manual:
 
         submitted = st.form_submit_button("✅ Salva", use_container_width=True)
         if submitted:
-            dt = pd.Timestamp(datetime.combine(m_date, m_time))
-            bmi_val = float(m_bmi) if float(m_bmi) > 0 else (
-                float(m_weight) / (height_m**2) if height_m > 0 else np.nan
-            )
+            try:
+                dt = pd.Timestamp(datetime.combine(m_date, m_time))
+                bmi_val = float(m_bmi) if float(m_bmi) > 0 else (
+                    float(m_weight) / (height_m**2) if height_m > 0 else np.nan
+                )
 
-            insert_manual_entry(dt, float(m_weight), bmi_val)
+                insert_manual_entry(dt, float(m_weight), bmi_val)
 
-            st.success("Misura manuale salvata nel database.")
-            load_renpho_csv.clear()
-            st.rerun()
+                st.success("Misura salvata in modo permanente.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Errore salvataggio misura manuale: {e}")
 
     st.markdown("---")
     st.subheader("🗑️ Cancella misure manuali")
@@ -620,19 +585,24 @@ with tab_manual:
         selected_ids = tmp.loc[tmp["label"].isin(selected_labels), "id"].astype(int).tolist()
 
         col1, col2 = st.columns(2)
-
         if col1.button("🗑️ Cancella selezionate", use_container_width=True, type="primary"):
             if selected_ids:
-                delete_manual_entries_by_id(selected_ids)
-                st.success("Misure selezionate cancellate.")
-                st.rerun()
+                try:
+                    delete_manual_entries_by_id(selected_ids)
+                    st.success("Misure selezionate cancellate.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Errore cancellazione: {e}")
             else:
                 st.warning("Seleziona almeno un record.")
 
         if col2.button("⚠️ Cancella TUTTO", use_container_width=True):
-            clear_manual_entries()
-            st.success("Archivio manuale azzerato.")
-            st.rerun()
+            try:
+                clear_manual_entries()
+                st.success("Archivio manuale azzerato.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Errore cancellazione totale: {e}")
 
         st.markdown("---")
         st.subheader("Archivio misure manuali")
@@ -641,8 +611,10 @@ with tab_manual:
         show_manual["Data"] = show_manual["date"].dt.strftime("%Y-%m-%d %H:%M")
         show_manual["Peso (kg)"] = show_manual["weight"].map(lambda x: f"{x:.2f}")
         show_manual["BMI"] = show_manual["bmi"].map(lambda x: f"{x:.2f}" if pd.notna(x) and np.isfinite(x) else "")
+        show_manual["Origine"] = show_manual["source"]
+
         st.dataframe(
-            show_manual[["Data", "Peso (kg)", "BMI", "source"]],
+            show_manual[["Data", "Peso (kg)", "BMI", "Origine"]],
             use_container_width=True,
             hide_index=True,
         )
