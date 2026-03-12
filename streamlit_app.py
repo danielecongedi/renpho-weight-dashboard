@@ -716,6 +716,41 @@ with tab_dash:
             f"RMSE={hw_rmse:.2f} kg (errore medio del modello in-sample)",
             style=style), unsafe_allow_html=True)
 
+    # ── Medie kg/sett su 3 orizzonti ──────────────────────────────
+    if not weekly_df.empty:
+        wdf_valid = weekly_df.dropna(subset=["loss"]).copy()
+        wdf_valid = wdf_valid[wdf_valid["loss"].between(0, 5)]
+
+        def mean_loss(n_weeks):
+            sub = wdf_valid.tail(n_weeks)
+            if len(sub) < 2: return None
+            return float(sub["loss"].mean())
+
+        pace_4   = mean_loss(4)
+        pace_8   = mean_loss(8)
+        pace_all = float(wdf_valid["loss"].mean()) if len(wdf_valid) >= 2 else None
+
+        st.markdown(section_html("📊","Media kg/settimana persi"), unsafe_allow_html=True)
+        pm1, pm2, pm3 = st.columns(3)
+        pm1.metric(
+            "Ultime 4 settimane",
+            f"−{pace_4:.2f} kg/sett" if pace_4 else "—",
+            f"su {min(4, len(wdf_valid))} settimane reali")
+        pm2.metric(
+            "Ultime 8 settimane",
+            f"−{pace_8:.2f} kg/sett" if pace_8 else "—",
+            f"su {min(8, len(wdf_valid))} settimane reali")
+        pm3.metric(
+            "Tutto lo storico",
+            f"−{pace_all:.2f} kg/sett" if pace_all else "—",
+            f"su {len(wdf_valid)} settimane totali")
+        st.markdown(nota_html(
+            "La <b>media kg/sett</b> è calcolata sugli <b>anchor settimanali</b> "
+            "(peso stimato ogni sabato). Non è la media dei singoli pesaggi: "
+            "vengono usati solo i punti sabato per eliminare la variabilità infrasettimanale. "
+            "Il confronto tra 4, 8 settimane e storico ti dice se stai accelerando, rallentando o sei stabile."
+        ), unsafe_allow_html=True)
+
     # ── Grafico peso ────────────────────────────────────────────────
     st.markdown(section_html("📈", "Andamento del peso"), unsafe_allow_html=True)
 
@@ -930,6 +965,85 @@ with tab_forecast:
                 f"Basato su un ritmo di −{hw_weekly_loss:.2f} kg/sett. "
                 f"Se il ritmo cambia, la data cambia proporzionalmente.",
                 style=style), unsafe_allow_html=True)
+
+        # ── Grafico forecast ─────────────────────────────────────
+        st.markdown(section_html("📈","Grafico forecast"), unsafe_allow_html=True)
+
+        if not fc_df.empty:
+            fig_fc = go.Figure()
+
+            # Banda ±95%
+            fig_fc.add_trace(go.Scatter(
+                x=list(fc_df["saturday"]) + list(fc_df["saturday"])[::-1],
+                y=list(fc_df["high"])     + list(fc_df["low"])[::-1],
+                fill="toself", mode="none",
+                fillcolor="rgba(224,123,32,0.12)",
+                name="Intervallo ±95%",
+                hoverinfo="skip"))
+
+            # Linea forecast
+            fig_fc.add_trace(go.Scatter(
+                x=fc_df["saturday"], y=fc_df["forecast"],
+                mode="lines+markers", name="Previsione (sabati)",
+                line=dict(color=PC["amber"], width=2.5),
+                marker=dict(size=7, color=PC["amber"],
+                            line=dict(width=2, color="white")),
+                hovertemplate=(
+                    "<b>%{x|%d %b %Y}</b><br>"
+                    "Previsto: <b>%{y:.2f} kg</b><extra></extra>")))
+
+            # Punti anchor storici (ultimi N)
+            hist_pts = weekly_df.tail(int(n_fc_sats)).copy()
+            fig_fc.add_trace(go.Scatter(
+                x=hist_pts["saturday"], y=hist_pts["anchor"],
+                mode="markers", name="Storico sabati",
+                marker=dict(size=6, color=PC["green"],
+                            line=dict(width=1.5, color="white")),
+                hovertemplate=(
+                    "<b>%{x|%d %b %Y}</b><br>"
+                    "Reale: <b>%{y:.2f} kg</b><extra></extra>")))
+
+            # Target line
+            fig_fc.add_hline(
+                y=float(target_weight), line_dash="dot",
+                line_color=PC["red"], line_width=1.5,
+                annotation_text="🎯 Target",
+                annotation_font_color=PC["red"],
+                annotation_position="bottom right")
+
+            # Linea verticale oggi
+            today_ts = pd.Timestamp(today).to_pydatetime()
+            fig_fc.add_shape(type="line", xref="x", yref="paper",
+                             x0=today_ts, x1=today_ts, y0=0, y1=1,
+                             line=dict(dash="dot", color=PC["text3"], width=1))
+            fig_fc.add_annotation(x=today_ts, y=0.99, xref="x", yref="paper",
+                                  text="oggi", showarrow=False,
+                                  xanchor="left", yanchor="top",
+                                  font=dict(size=10, color=PC["text3"]))
+
+            if target_date_est:
+                xp = pd.Timestamp(target_date_est).to_pydatetime()
+                fig_fc.add_shape(type="line", xref="x", yref="paper",
+                                 x0=xp, x1=xp, y0=0, y1=1,
+                                 line=dict(dash="dot", color=PC["green"], width=1.2))
+                fig_fc.add_annotation(x=xp, y=0.99, xref="x", yref="paper",
+                                      text=f"target {target_date_est.strftime('%d %b')}",
+                                      showarrow=False, xanchor="left", yanchor="top",
+                                      font=dict(size=10, color=PC["green"]))
+
+            fig_fc.update_layout(**layout_kw(
+                height=380, margin=dict(l=10, r=10, t=16, b=10),
+                ytitle="Peso (kg)",
+                yextra=dict(tickformat=".1f", ticksuffix=" kg")))
+            st.plotly_chart(fig_fc, use_container_width=True)
+
+            st.markdown(nota_html(
+                f"<b>Linea arancione</b> = previsione puntuale ogni sabato (Holt-Winters). "
+                f"<b>Fascia arancione</b> = intervallo ±95%: il peso reale dovrebbe cadere qui ~95% delle volte. "
+                f"Si allarga nel tempo perché l'incertezza si accumula (formula: ±1.96 · RMSE · √settimane). "
+                f"<b>Punti verdi</b> = sabati storici reali usati per fittare il modello. "
+                f"<b>RMSE={hw_rmse:.2f} kg</b>: errore medio del modello sui sabati già noti."
+            ), unsafe_allow_html=True)
 
         # ── Tabella sabati previsti ──────────────────────────────
         if not fc_df.empty:
