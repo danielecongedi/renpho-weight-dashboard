@@ -563,6 +563,11 @@ def load_manual() -> pd.DataFrame:
     df["source"] = df.get("source","manual").fillna("manual")
     return df.dropna(subset=["date","weight"]).sort_values("date").reset_index(drop=True)
 
+def _invalidate_data_caches():
+    load_manual.clear()
+    fit_hw_model.clear()
+    find_optimal_lookback.clear()
+
 def insert_manual_entry(dt, weight, bmi):
     ex = load_manual()
     if not ex.empty and ((ex["date"] - dt).abs() < pd.Timedelta(minutes=1)).any():
@@ -770,27 +775,6 @@ with tab_dash:
               target_date_est.strftime("%d %b %Y") if target_date_est else "—",
               f"tra {days_to_target} giorni" if days_to_target else
               ("non converge" if hw.get("ok") else "dati insuff."))
-
-    # ── Forecast prossimo sabato ────────────────────────────────────
-    st.markdown(section_html("🔮", "Forecast prossimo sabato"), unsafe_allow_html=True)
-    if not fc_df.empty:
-        nxt = fc_df.iloc[0]
-        nxt_date   = pd.Timestamp(nxt["saturday"])
-        nxt_fc     = float(nxt["forecast"])
-        nxt_low    = float(nxt["low"])
-        nxt_high   = float(nxt["high"])
-        nxt_delta  = nxt_fc - last_w
-        cs1, cs2, cs3 = st.columns(3)
-        cs1.metric(
-            f"🔮 Sabato {nxt_date.strftime('%d %b %Y')}",
-            f"{nxt_fc:.2f} kg",
-            f"{nxt_delta:+.2f} kg vs ultima misura",
-            delta_color="inverse")
-        cs2.metric("📉 IC 95% — limite inferiore", f"{nxt_low:.2f} kg")
-        cs3.metric("📈 IC 95% — limite superiore", f"{nxt_high:.2f} kg")
-    else:
-        reason = hw.get("reason", "dati insufficienti") if not hw.get("ok") else "forecast vuoto"
-        st.warning(f"Forecast non disponibile: {reason}. Servono almeno 6 sabati storici.")
 
     # ── Progress ───────────────────────────────────────────────────
     st.markdown(
@@ -1061,32 +1045,35 @@ with tab_manual:
                 st.error(f"Errore: {e}")
 
     st.divider()
-    st.markdown(section_html("🗑️","Gestione archivio manuale"), unsafe_allow_html=True)
+    st.markdown(section_html("🗑️","Archivio misure manuali"), unsafe_allow_html=True)
     manual_now = load_manual()
     if manual_now.empty:
         st.info("Nessuna misura manuale.")
     else:
-        tmp = manual_now.copy()
-        tmp["label"] = (tmp["date"].dt.strftime("%Y-%m-%d %H:%M")+" │ "
-                        +tmp["weight"].map(lambda x: f"{x:.2f} kg"))
-        sel_labels = st.multiselect("Seleziona da cancellare", tmp["label"].tolist())
-        sel_ids    = tmp.loc[tmp["label"].isin(sel_labels),"id"].astype(int).tolist()
-        cc1, cc2   = st.columns(2)
-        if cc1.button("🗑️ Cancella selezionate", use_container_width=True, type="primary"):
-            if sel_ids:
-                try: delete_manual_by_id(sel_ids); st.success("Cancellate."); st.rerun()
-                except Exception as e: st.error(f"Errore: {e}")
-            else: st.warning("Seleziona almeno un record.")
-        if cc2.button("⚠️ Cancella TUTTO", use_container_width=True):
-            try: clear_manual(); st.success("Azzerato."); st.rerun()
-            except Exception as e: st.error(f"Errore: {e}")
-        sm = tmp.sort_values("date",ascending=False).copy()
-        sm["Data"]      = sm["date"].dt.strftime("%Y-%m-%d  %H:%M")
-        sm["Peso (kg)"] = sm["weight"].map(lambda x: f"{x:.2f}")
-        sm["BMI"]       = sm["bmi"].map(lambda x: f"{x:.2f}" if pd.notna(x) and np.isfinite(x) else "")
-        sm["Origine"]   = sm["source"]
-        st.dataframe(sm[["Data","Peso (kg)","BMI","Origine"]],
-                     use_container_width=True, hide_index=True)
+        editor_df = manual_now.sort_values("date", ascending=False).copy()
+        editor_df.insert(0, "Elimina", False)
+        editor_df["Data"]      = editor_df["date"].dt.strftime("%Y-%m-%d  %H:%M")
+        editor_df["Peso (kg)"] = editor_df["weight"].map(lambda x: f"{x:.2f}")
+        editor_df["BMI"]       = editor_df["bmi"].map(lambda x: f"{x:.2f}" if pd.notna(x) and np.isfinite(x) else "—")
+
+        edited = st.data_editor(
+            editor_df[["Elimina","Data","Peso (kg)","BMI"]],
+            column_config={"Elimina": st.column_config.CheckboxColumn("🗑️", width="small")},
+            use_container_width=True,
+            hide_index=True,
+            key="manual_editor"
+        )
+
+        sel_ids = editor_df.loc[edited["Elimina"].values, "id"].astype(int).tolist()
+        if sel_ids:
+            st.warning(f"{len(sel_ids)} misura/e selezionata/e per l'eliminazione.")
+            if st.button("🗑️ Conferma eliminazione", type="primary", use_container_width=True):
+                try:
+                    delete_manual_by_id(sel_ids)
+                    st.success(f"Eliminate {len(sel_ids)} misura/e.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Errore: {e}")
 
 # ═══════════════════════════════════════════════════════════════════
 # TAB — FORECAST
