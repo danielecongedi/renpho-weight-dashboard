@@ -548,6 +548,52 @@ def estimate_target_date_hw(hw: dict, target_w: float):
             return sat.date(), max(0, days_from_today)
     return None, None
 
+
+def forecast_short_term(daily_series: pd.Series, next_sat: date, n_days: int = 10):
+    """
+    Forecast 'reale' per il prossimo sabato basato sugli ultimi n_days
+    della serie giornaliera interpolata (Akima).
+    Usa regressione lineare OLS + intervallo di predizione al 95%.
+    Ritorna dict con: ok, forecast, low, high, n_points, slope_per_day.
+    """
+    s = daily_series.dropna()
+    if s.empty:
+        return {"ok": False}
+
+    cutoff = s.index.max() - pd.Timedelta(days=n_days - 1)
+    window = s[s.index >= cutoff]
+    if len(window) < 3:
+        return {"ok": False}
+
+    x = np.array([(d - window.index[0]).days for d in window.index], dtype=float)
+    y = window.values.astype(float)
+    n = len(x)
+
+    # OLS
+    x_mean = x.mean()
+    Sxx    = float(np.sum((x - x_mean) ** 2))
+    b      = float(np.sum((x - x_mean) * (y - y.mean())) / Sxx) if Sxx > 0 else 0.0
+    a      = float(y.mean() - b * x_mean)
+
+    x_pred = float((pd.Timestamp(next_sat) - window.index[0]).days)
+    y_pred = a + b * x_pred
+
+    resid  = y - (a + b * x)
+    s_err  = float(np.sqrt(np.sum(resid ** 2) / max(n - 2, 1)))
+    # Intervallo di predizione al 95%
+    pred_se = s_err * float(np.sqrt(1 + 1 / n + (x_pred - x_mean) ** 2 / Sxx)) if Sxx > 0 else s_err
+    ci      = 1.96 * pred_se
+
+    return {
+        "ok":           True,
+        "forecast":     round(float(y_pred), 2),
+        "low":          round(float(y_pred - ci), 2),
+        "high":         round(float(y_pred + ci), 2),
+        "n_points":     n,
+        "slope_per_day": round(float(b), 4),
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════
 # SUPABASE
 # ═══════════════════════════════════════════════════════════════════
@@ -738,7 +784,8 @@ opt_lookback, opt_lookback_rmse = find_optimal_lookback(weekly_df)
 hw           = fit_hw_model(weekly_df, lookback_weeks=opt_lookback)
 fc_df        = hw_forecast_saturdays(hw, n_saturdays=int(n_fc_sats)) if hw.get("ok") else pd.DataFrame()
 target_date_est, days_to_target = estimate_target_date_hw(hw, float(target_weight))
-trend_change = detect_trend_change(weekly_df)
+trend_change  = detect_trend_change(weekly_df)
+fc_short      = forecast_short_term(daily_series, next_saturday(date.today()))
 
 # Ritmo HW: trend per settimana (negativo = perdita)
 hw_weekly_loss = float(-hw["last_trend"]) if hw.get("ok") else None
@@ -783,21 +830,34 @@ with tab_dash:
               ("non converge" if hw.get("ok") else "dati insuff."))
 
     # ── Forecast prossimo sabato ────────────────────────────────────
-    st.markdown(section_html("🔮", "Forecast prossimo sabato"), unsafe_allow_html=True)
-    if not fc_df.empty:
-        nxt       = fc_df.iloc[0]
-        nxt_date  = pd.Timestamp(nxt["saturday"])
-        nxt_fc    = float(nxt["forecast"])
-        nxt_delta = nxt_fc - last_w
-        cs1, cs2, cs3 = st.columns(3)
-        cs1.metric(f"🔮 {fmt_date_it(nxt_date)}",
-                   f"{nxt_fc:.2f} kg",
-                   f"{nxt_delta:+.2f} kg vs ultima misura",
-                   delta_color="inverse")
-        cs2.metric("📉 IC 95% — limite inferiore", f"{float(nxt['low']):.2f} kg")
-        cs3.metric("📈 IC 95% — limite superiore", f"{float(nxt['high']):.2f} kg")
-    else:
-        st.warning(f"Forecast non disponibile: {hw.get('reason', 'dati insufficienti')}.")
+    nxt_sat_date = next_saturday(date.today())
+    st.markdown(section_html("🔮", f"Forecast prossimo sabato — {fmt_date_it(nxt_sat_date)}"), unsafe_allow_html=True)
+
+    col_hw, col_rt = st.columns(2)
+
+    with col_hw:
+        st.caption("📈 Tendenziale (Holt-Winters)")
+        if not fc_df.empty:
+            nxt      = fc_df.iloc[0]
+            nxt_fc   = float(nxt["forecast"])
+            nxt_delta = nxt_fc - last_w
+            st.metric("Peso previsto", f"{nxt_fc:.2f} kg",
+                      f"{nxt_delta:+.2f} kg vs ultima misura", delta_color="inverse")
+            st.metric("IC 95%", f"{float(nxt['low']):.2f} – {float(nxt['high']):.2f} kg")
+        else:
+            st.warning("Dati HW insufficienti.")
+
+    with col_rt:
+        st.caption("📊 Reale (regressione 10 giorni)")
+        if fc_short.get("ok"):
+            rt_delta = fc_short["forecast"] - last_w
+            slope_week = fc_short["slope_per_day"] * 7
+            st.metric("Peso previsto", f"{fc_short['forecast']:.2f} kg",
+                      f"{rt_delta:+.2f} kg vs ultima misura", delta_color="inverse")
+            st.metric("IC 95%", f"{fc_short['low']:.2f} – {fc_short['high']:.2f} kg")
+            st.caption(f"Ritmo stimato: {slope_week:+.2f} kg/sett · su {fc_short['n_points']} punti")
+        else:
+            st.warning("Dati recenti insufficienti (min 3 punti).")
 
     # ── Progress ───────────────────────────────────────────────────
     st.markdown(
