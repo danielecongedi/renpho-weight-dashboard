@@ -361,6 +361,71 @@ def build_weekly_anchors(daily_series: pd.Series) -> pd.DataFrame:
 #     residua in-sample, scalata con √t (propagazione dell'incertezza).
 #   - Fallback a regressione lineare robusta se i dati sono troppo pochi.
 
+@st.cache_data(ttl=300, show_spinner=False)
+def find_optimal_lookback(weekly_df: pd.DataFrame, candidates=None):
+    """
+    Walk-forward cross-validation: prova diversi lookback e sceglie quello
+    con RMSE out-of-sample minimo.
+    Ritorna (best_lookback, best_oos_rmse).
+    """
+    if candidates is None:
+        candidates = [6, 8, 10, 12, 16, 20]
+    valid = weekly_df.dropna(subset=["anchor"]).reset_index(drop=True)
+    best_k, best_rmse = candidates[0], np.inf
+    for k in candidates:
+        if len(valid) < k + 3:
+            continue
+        errors = []
+        for i in range(k, len(valid)):
+            y = valid.iloc[i - k:i]["anchor"].values.astype(float)
+            actual = float(valid.iloc[i]["anchor"])
+            if not np.all(np.isfinite(y)):
+                continue
+            try:
+                fit = ExponentialSmoothing(
+                    y, trend="add", seasonal=None,
+                    initialization_method="estimated"
+                ).fit(optimized=True, remove_bias=True)
+                pred = float(fit.level[-1]) + float(fit.trend[-1])
+                errors.append((actual - pred) ** 2)
+            except Exception:
+                continue
+        if len(errors) >= 3:
+            rmse = float(np.sqrt(np.mean(errors)))
+            if rmse < best_rmse:
+                best_rmse = rmse
+                best_k = k
+    return best_k, best_rmse
+
+
+def detect_trend_change(weekly_df: pd.DataFrame, short_weeks: int = 4, long_weeks: int = 12):
+    """
+    Confronta il trend lineare (kg/sett) delle ultime `short_weeks` settimane
+    con quello delle ultime `long_weeks`.
+    Ritorna dict con short_trend, long_trend, change_pct oppure None se dati insufficienti.
+    """
+    valid = weekly_df.dropna(subset=["anchor"]).sort_values("saturday").reset_index(drop=True)
+    if len(valid) < long_weeks:
+        return None
+
+    def lin_trend(sub):
+        x = np.arange(len(sub), dtype=float)
+        y = sub["anchor"].values.astype(float)
+        return float(np.polyfit(x, y, 1)[0]) if len(x) >= 2 else None
+
+    short = lin_trend(valid.tail(short_weeks))
+    long_ = lin_trend(valid.tail(long_weeks))
+    if short is None or long_ is None or abs(long_) < 1e-9:
+        return None
+    return {
+        "short_trend":  short,
+        "long_trend":   long_,
+        "change_pct":   (short - long_) / abs(long_) * 100,
+        "short_weeks":  short_weeks,
+        "long_weeks":   long_weeks,
+    }
+
+
 @st.cache_data(ttl=300, show_spinner="Calcolo modello Holt-Winters…")
 def fit_hw_model(weekly_df: pd.DataFrame, lookback_weeks: int = HW_LOOKBACK_WEEKS):
     """
@@ -420,31 +485,37 @@ def fit_hw_model(weekly_df: pd.DataFrame, lookback_weeks: int = HW_LOOKBACK_WEEK
         return {"ok": False, "reason": str(e)}
 
 
-def hw_forecast_saturdays(hw: dict, n_saturdays: int = HW_FORECAST_SATS):
+def hw_forecast_saturdays(hw: dict, n_saturdays: int = HW_FORECAST_SATS, n_boot: int = 500):
     """
     Produce n_saturdays previsioni future con Holt-Winters.
-    Intervallo di confidenza: ±1.96 * rmse * √h  (h = orizzonte in settimane)
-    Questo è l'intervallo al ~95% sotto ipotesi di errori i.i.d. gaussiani.
+    Intervallo di confidenza al 95% via bootstrap sui residui in-sample:
+    per ogni orizzonte h si campionano h residui con reimmissione e si
+    sommano al forecast puntuale — i percentili 2.5/97.5 formano il CI.
+    Questo evita l'assunzione di errori i.i.d. gaussiani dell'approccio analitico.
     """
     if not hw.get("ok"):
         return pd.DataFrame()
 
-    level = hw["last_level"]
-    trend = hw["last_trend"]
-    rmse  = hw["rmse"]
-    last_sat = hw["last_saturday"]
+    level     = hw["last_level"]
+    trend     = hw["last_trend"]
+    residuals = np.array(hw["residuals"])
+    last_sat  = hw["last_saturday"]
+    rng       = np.random.default_rng(42)
 
     rows = []
     for h in range(1, n_saturdays + 1):
         sat    = last_sat + pd.Timedelta(weeks=h)
         center = level + h * trend
-        # Incertezza cresce con √h: più lontano, meno siamo sicuri
-        ci     = 1.96 * rmse * np.sqrt(h)
+        # Accumulo di h innovazioni campionate con reimmissione
+        boot = np.array([
+            center + float(np.sum(rng.choice(residuals, size=h, replace=True)))
+            for _ in range(n_boot)
+        ])
         rows.append({
             "saturday": sat,
             "forecast": round(float(center), 2),
-            "low":      round(float(center - ci), 2),
-            "high":     round(float(center + ci), 2),
+            "low":      round(float(np.percentile(boot, 2.5)), 2),
+            "high":     round(float(np.percentile(boot, 97.5)), 2),
         })
 
     return pd.DataFrame(rows)
@@ -491,11 +562,6 @@ def load_manual() -> pd.DataFrame:
     df["bmi"]    = pd.to_numeric(df["bmi"],    errors="coerce")
     df["source"] = df.get("source","manual").fillna("manual")
     return df.dropna(subset=["date","weight"]).sort_values("date").reset_index(drop=True)
-
-def _invalidate_data_caches():
-    """Invalida le cache dei dati e del modello HW dopo ogni modifica al dataset."""
-    load_manual.clear()
-    fit_hw_model.clear()
 
 def insert_manual_entry(dt, weight, bmi):
     ex = load_manual()
@@ -657,9 +723,11 @@ progress_pct  = max(0.0, min(100.0, loss_base / total_journey * 100)) if total_j
 # ═══════════════════════════════════════════════════════════════════
 daily_series = build_daily_series(daily)
 weekly_df    = build_weekly_anchors(daily_series)
-hw           = fit_hw_model(weekly_df, lookback_weeks=HW_LOOKBACK_WEEKS)
+opt_lookback, opt_lookback_rmse = find_optimal_lookback(weekly_df)
+hw           = fit_hw_model(weekly_df, lookback_weeks=opt_lookback)
 fc_df        = hw_forecast_saturdays(hw, n_saturdays=int(n_fc_sats)) if hw.get("ok") else pd.DataFrame()
 target_date_est, days_to_target = estimate_target_date_hw(hw, float(target_weight))
+trend_change = detect_trend_change(weekly_df)
 
 # Ritmo HW: trend per settimana (negativo = perdita)
 hw_weekly_loss = float(-hw["last_trend"]) if hw.get("ok") else None
@@ -737,10 +805,42 @@ with tab_dash:
         style = "" if hw_weekly_loss >= 0.30 else "amber" if hw_weekly_loss >= 0.10 else "red"
         st.markdown(banner_html(
             "📈",
-            f"Ritmo stimato (Holt-Winters): −{hw_weekly_loss:.2f} kg/settimana",
+            f"Ritmo stimato (Holt-Winters): −{hw_weekly_loss:.2f} kg/settimana "
+            f"· Lookback ottimale: {opt_lookback} sett (RMSE OOS={opt_lookback_rmse:.2f} kg)",
             f"α={hw['alpha']:.2f} (reattività al livello) · "
-            f"RMSE={hw_rmse:.2f} kg (errore medio del modello in-sample)",
+            f"RMSE={hw_rmse:.2f} kg (errore medio in-sample)",
             style=style), unsafe_allow_html=True)
+
+        # Banner "sei in pari con il piano?"
+        days_since = (date.today() - hw["last_saturday"].date()).days
+        expected_today = hw["last_level"] + (days_since / 7.0) * hw["last_trend"]
+        diff_plan = last_w - expected_today
+        if abs(diff_plan) > 0.05:
+            plan_style = "" if diff_plan < 0 else "red"
+            plan_icon  = "✅" if diff_plan < 0 else "⚠️"
+            plan_label = "Sei SOTTO il piano" if diff_plan < 0 else "Sei SOPRA il piano"
+            st.markdown(banner_html(
+                plan_icon,
+                f"{plan_label}: {diff_plan:+.2f} kg rispetto alla previsione di oggi",
+                f"Il modello si aspettava {expected_today:.2f} kg oggi · "
+                f"Ultima misura: {last_w:.2f} kg",
+                style=plan_style), unsafe_allow_html=True)
+
+        # Banner cambio trend
+        if trend_change is not None:
+            cp = trend_change["change_pct"]
+            if abs(cp) >= 30:
+                tc_icon  = "🚀" if cp < -30 else "🐢"
+                tc_label = "Stai accelerando" if cp < -30 else "Stai rallentando (possibile plateau)"
+                tc_style = "" if cp < -30 else "amber" if abs(cp) < 60 else "red"
+                st.markdown(banner_html(
+                    tc_icon,
+                    f"{tc_label}: trend ultime {trend_change['short_weeks']} sett "
+                    f"= {trend_change['short_trend']:+.2f} kg/sett vs "
+                    f"storico {trend_change['long_weeks']} sett "
+                    f"= {trend_change['long_trend']:+.2f} kg/sett",
+                    f"Variazione del ritmo: {cp:+.0f}% rispetto allo storico.",
+                    style=tc_style), unsafe_allow_html=True)
 
     # ── Medie kg/sett su 3 orizzonti ──────────────────────────────
     if not weekly_df.empty:
@@ -825,6 +925,21 @@ with tab_dash:
                         line=dict(width=1.5, color="white")),
             hovertemplate="<b>%{x|%d %b}</b><br>Anchor sabato: %{y:.2f} kg<extra></extra>"))
 
+    # Linea forecast nel grafico principale
+    if not fc_df.empty:
+        fig.add_trace(go.Scatter(
+            x=pd.concat([fc_df["saturday"], fc_df["saturday"].iloc[::-1]]),
+            y=pd.concat([fc_df["high"], fc_df["low"].iloc[::-1]]),
+            fill="toself", mode="none",
+            fillcolor="rgba(224,123,32,0.10)",
+            name="Forecast IC 95%", hoverinfo="skip"))
+        fig.add_trace(go.Scatter(
+            x=fc_df["saturday"], y=fc_df["forecast"],
+            mode="lines+markers", name="Forecast (sabati)",
+            line=dict(color=PC["amber"], width=2, dash="dash"),
+            marker=dict(size=5, color=PC["amber"]),
+            hovertemplate="<b>%{x|%d %b}</b><br>Previsto: %{y:.2f} kg<extra>Forecast</extra>"))
+
     fig.add_hline(y=float(target_weight), line_dash="dot",
                   line_color=PC["red"], line_width=1.5,
                   annotation_text="🎯 Target",
@@ -862,32 +977,54 @@ with tab_dash:
     ].copy()
 
     if not wdf_hist.empty:
+        # Costruisci mappa sabato→fitted dal modello HW (dove disponibile)
+        fitted_map = {}
+        if hw.get("ok"):
+            hw_sub = hw["weekly_df_used"].copy()
+            hw_sub["saturday"] = pd.to_datetime(hw_sub["saturday"])
+            for _, fr in hw_sub.iterrows():
+                idx = int(fr.name)
+                if idx < len(hw["fitted"]):
+                    fitted_map[fr["saturday"].normalize()] = float(hw["fitted"][idx])
+
         rows_html = ""
         for _, row in wdf_hist.sort_values("saturday", ascending=False).iterrows():
             sat_str  = pd.to_datetime(row["saturday"]).strftime("%d %b %Y")
             anchor_s = f"{row['anchor']:.2f} kg"
             if pd.notna(row["loss"]) and np.isfinite(row["loss"]):
-                loss_v   = float(row["loss"])
-                loss_s   = f"−{loss_v:.2f} kg"
-                cls      = loss_class(loss_v)
+                loss_v = float(row["loss"])
+                loss_s = f"−{loss_v:.2f} kg"
+                cls    = loss_class(loss_v)
             else:
                 loss_s = "—"; cls = ""
+            sat_key = pd.to_datetime(row["saturday"]).normalize()
+            if sat_key in fitted_map:
+                diff = float(row["anchor"]) - fitted_map[sat_key]
+                diff_s = f"{diff:+.2f} kg"
+                diff_color = "#166b3c" if diff < 0 else "#b94a48"
+                vs_fc_s = f'<span style="color:{diff_color};font-weight:600">{diff_s}</span>'
+            else:
+                vs_fc_s = "—"
             rows_html += (
                 f"<tr>"
                 f"<td>{sat_str}</td>"
                 f"<td>{anchor_s}</td>"
                 f'<td class="{cls}">{loss_s}</td>'
+                f"<td>{vs_fc_s}</td>"
                 f"</tr>"
             )
         st.markdown(
             f'<table class="wm-week-table">'
-            f"<thead><tr><th>Settimana (sabato)</th><th>Peso sabato</th><th>Perso vs sett. prec.</th></tr></thead>"
+            f"<thead><tr><th>Settimana (sabato)</th><th>Peso sabato</th>"
+            f"<th>Perso vs sett. prec.</th><th>vs Forecast HW</th></tr></thead>"
             f"<tbody>{rows_html}</tbody></table>",
             unsafe_allow_html=True)
         st.markdown(nota_html(
             f"<b>Verde</b> = più di 0.30 kg persi · "
             f"<b>Arancione</b> = tra 0.10 e 0.30 kg · "
-            f"<b>Rosso</b> = meno di 0.10 kg (plateau)."
+            f"<b>Rosso</b> = meno di 0.10 kg (plateau). "
+            f"<b>vs Forecast HW</b>: differenza tra peso reale e stima del modello per quel sabato "
+            f"(verde = sotto la previsione = meglio del previsto, rosso = sopra)."
         ), unsafe_allow_html=True)
 
     # ── Ultime 10 misure ────────────────────────────────────────────
