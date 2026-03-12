@@ -492,6 +492,11 @@ def load_manual() -> pd.DataFrame:
     df["source"] = df.get("source","manual").fillna("manual")
     return df.dropna(subset=["date","weight"]).sort_values("date").reset_index(drop=True)
 
+def _invalidate_data_caches():
+    """Invalida le cache dei dati e del modello HW dopo ogni modifica al dataset."""
+    load_manual.clear()
+    fit_hw_model.clear()
+
 def insert_manual_entry(dt, weight, bmi):
     ex = load_manual()
     if not ex.empty and ((ex["date"] - dt).abs() < pd.Timedelta(minutes=1)).any():
@@ -502,16 +507,16 @@ def insert_manual_entry(dt, weight, bmi):
         "bmi":    float(bmi) if bmi is not None and pd.notna(bmi) else None,
         "source": "manual",
     }).execute()
-    load_manual.clear()
+    _invalidate_data_caches()
 
 def delete_manual_by_id(ids):
     if not ids: return
     get_supabase().table("manual_entries").delete().in_("id", ids).execute()
-    load_manual.clear()
+    _invalidate_data_caches()
 
 def clear_manual():
     get_supabase().table("manual_entries").delete().neq("id", 0).execute()
-    load_manual.clear()
+    _invalidate_data_caches()
 
 # ═══════════════════════════════════════════════════════════════════
 # RENPHO CSV
