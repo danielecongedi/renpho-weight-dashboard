@@ -249,6 +249,12 @@ def fmt_delta(v, dec=2):
     if v is None or not np.isfinite(float(v)): return None
     return f"{float(v):+.{dec}f}"
 
+_DAYS_IT = ["Lun","Mar","Mer","Gio","Ven","Sab","Dom"]
+def fmt_date_it(dt, show_year=True):
+    d = pd.Timestamp(dt)
+    day = _DAYS_IT[d.weekday()]
+    return f"{day} {d.strftime('%d/%m/%Y')}" if show_year else f"{day} {d.strftime('%d/%m')}"
+
 def next_saturday(d: date) -> date:
     days = (5 - d.weekday()) % 7
     r = d + timedelta(days=days)
@@ -308,7 +314,7 @@ def build_daily_series(daily_df: pd.DataFrame) -> pd.Series:
 # ANCHOR SETTIMANALE (WLS sul sabato)
 # ═══════════════════════════════════════════════════════════════════
 
-def local_anchor(series: pd.Series, target, max_dist=4):
+def local_anchor(series: pd.Series, target, max_dist=6):
     target = pd.to_datetime(target).normalize()
     if target in series.index and pd.notna(series.loc[target]):
         return float(series.loc[target])
@@ -772,7 +778,7 @@ with tab_dash:
               f"{dist_target:+.2f} kg",
               (fmt_delta(delta_dist,2)+" kg") if delta_dist else "—", delta_color="inverse")
     c4.metric("📅 Arrivo stimato",
-              target_date_est.strftime("%d %b %Y") if target_date_est else "—",
+              fmt_date_it(target_date_est) if target_date_est else "—",
               f"tra {days_to_target} giorni" if days_to_target else
               ("non converge" if hw.get("ok") else "dati insuff."))
 
@@ -784,7 +790,7 @@ with tab_dash:
         nxt_fc    = float(nxt["forecast"])
         nxt_delta = nxt_fc - last_w
         cs1, cs2, cs3 = st.columns(3)
-        cs1.metric(f"🔮 Sabato {nxt_date.strftime('%d %b %Y')}",
+        cs1.metric(f"🔮 {fmt_date_it(nxt_date)}",
                    f"{nxt_fc:.2f} kg",
                    f"{nxt_delta:+.2f} kg vs ultima misura",
                    delta_color="inverse")
@@ -953,7 +959,7 @@ with tab_dash:
                       x0=xp, x1=xp, y0=0, y1=1,
                       line=dict(dash="dot", color=PC["green"], width=1.2))
         fig.add_annotation(x=xp, y=0.97, xref="x", yref="paper",
-                           text=f"target {target_date_est.strftime('%d %b')}",
+                           text=f"target {fmt_date_it(target_date_est, show_year=False)}",
                            showarrow=False, xanchor="left", yanchor="top",
                            font=dict(size=10, color=PC["green"]))
 
@@ -990,7 +996,7 @@ with tab_dash:
 
         rows_html = ""
         for _, row in wdf_hist.sort_values("saturday", ascending=False).iterrows():
-            sat_str  = pd.to_datetime(row["saturday"]).strftime("%d %b %Y")
+            sat_str  = fmt_date_it(row["saturday"])
             anchor_s = f"{row['anchor']:.2f} kg"
             if pd.notna(row["loss"]) and np.isfinite(row["loss"]):
                 loss_v = float(row["loss"])
@@ -1110,7 +1116,7 @@ with tab_forecast:
                      f"±{hw_rmse:.2f} kg",
                      f"su {hw['n_obs']} sabati storici")
         col_c.metric("Arrivo al target",
-                     target_date_est.strftime("%d %b %Y") if target_date_est else "—",
+                     fmt_date_it(target_date_est) if target_date_est else "—",
                      f"tra {days_to_target} giorni" if days_to_target else "—")
 
         st.markdown(nota_html(
@@ -1128,7 +1134,7 @@ with tab_forecast:
             st.markdown(banner_html(
                 "🏁",
                 f"Arrivo stimato al target ({float(target_weight):.1f} kg): "
-                f"{target_date_est.strftime('%d %b %Y')} — tra {days_to_target} giorni",
+                f"{fmt_date_it(target_date_est)} — tra {days_to_target} giorni",
                 f"Basato su un ritmo di −{hw_weekly_loss:.2f} kg/sett. "
                 f"Se il ritmo cambia, la data cambia proporzionalmente.",
                 style=style), unsafe_allow_html=True)
@@ -1194,7 +1200,7 @@ with tab_forecast:
                                  x0=xp, x1=xp, y0=0, y1=1,
                                  line=dict(dash="dot", color=PC["green"], width=1.2))
                 fig_fc.add_annotation(x=xp, y=0.99, xref="x", yref="paper",
-                                      text=f"target {target_date_est.strftime('%d %b')}",
+                                      text=f"target {fmt_date_it(target_date_est, show_year=False)}",
                                       showarrow=False, xanchor="left", yanchor="top",
                                       font=dict(size=10, color=PC["green"]))
 
@@ -1219,7 +1225,7 @@ with tab_forecast:
             # Costruisci HTML tabella con highlight target
             rows_html = ""
             for _, row in fc_df.iterrows():
-                sat_str = pd.to_datetime(row["saturday"]).strftime("%d %b %Y")
+                sat_str = fmt_date_it(row["saturday"])
                 fc_v    = float(row["forecast"])
                 low_v   = float(row["low"])
                 hi_v    = float(row["high"])
