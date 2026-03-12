@@ -785,7 +785,7 @@ hw           = fit_hw_model(weekly_df, lookback_weeks=opt_lookback)
 fc_df        = hw_forecast_saturdays(hw, n_saturdays=int(n_fc_sats)) if hw.get("ok") else pd.DataFrame()
 target_date_est, days_to_target = estimate_target_date_hw(hw, float(target_weight))
 trend_change  = detect_trend_change(weekly_df)
-fc_short      = forecast_short_term(daily_series, next_saturday(date.today()))
+fc_short      = forecast_short_term(daily_series, next_saturday(date.today()), n_days=15)
 
 # Ritmo HW: trend per settimana (negativo = perdita)
 hw_weekly_loss = float(-hw["last_trend"]) if hw.get("ok") else None
@@ -848,7 +848,7 @@ with tab_dash:
             st.warning("Dati HW insufficienti.")
 
     with col_rt:
-        st.caption("📊 Reale (regressione 10 giorni)")
+        st.caption("📊 Reale (regressione 15 giorni)")
         if fc_short.get("ok"):
             rt_delta = fc_short["forecast"] - last_w
             slope_week = fc_short["slope_per_day"] * 7
