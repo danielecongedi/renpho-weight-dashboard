@@ -704,6 +704,7 @@ with tab_dash:
               ("non converge" if hw.get("ok") else "dati insuff."))
 
     # ── Forecast prossimo sabato ────────────────────────────────────
+    st.markdown(section_html("🔮", "Forecast prossimo sabato"), unsafe_allow_html=True)
     if not fc_df.empty:
         nxt = fc_df.iloc[0]
         nxt_date   = pd.Timestamp(nxt["saturday"])
@@ -713,12 +714,15 @@ with tab_dash:
         nxt_delta  = nxt_fc - last_w
         cs1, cs2, cs3 = st.columns(3)
         cs1.metric(
-            f"🔮 Forecast sabato {nxt_date.strftime('%d %b')}",
+            f"🔮 Sabato {nxt_date.strftime('%d %b %Y')}",
             f"{nxt_fc:.2f} kg",
             f"{nxt_delta:+.2f} kg vs ultima misura",
             delta_color="inverse")
-        cs2.metric("📊 IC 95% — limite inferiore", f"{nxt_low:.2f} kg")
-        cs3.metric("📊 IC 95% — limite superiore", f"{nxt_high:.2f} kg")
+        cs2.metric("📉 IC 95% — limite inferiore", f"{nxt_low:.2f} kg")
+        cs3.metric("📈 IC 95% — limite superiore", f"{nxt_high:.2f} kg")
+    else:
+        reason = hw.get("reason", "dati insufficienti") if not hw.get("ok") else "forecast vuoto"
+        st.warning(f"Forecast non disponibile: {reason}. Servono almeno 6 sabati storici.")
 
     # ── Progress ───────────────────────────────────────────────────
     st.markdown(
