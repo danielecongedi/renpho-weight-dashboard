@@ -549,12 +549,16 @@ def estimate_target_date_hw(hw: dict, target_w: float):
     return None, None
 
 
-def forecast_short_term(daily_series: pd.Series, next_sat: date, n_days: int = 10):
+def forecast_short_term(daily_series: pd.Series, next_sat: date, n_days: int = 7):
     """
-    Forecast 'reale' per il prossimo sabato basato sugli ultimi n_days
-    della serie giornaliera interpolata (Akima).
-    Usa regressione lineare OLS + intervallo di predizione al 95%.
-    Ritorna dict con: ok, forecast, low, high, n_points, slope_per_day.
+    Forecast 'reale' per il prossimo sabato.
+    Stima la pendenza (kg/giorno) con OLS sugli ultimi n_days della serie
+    interpolata, ma àncora la previsione all'ULTIMO VALORE REALE per evitare
+    l'amplificazione dell'estrapolazione.
+
+    y_pred = ultimo_valore + slope × giorni_al_sabato
+
+    IC 95% basato sui residui OLS scalati per i giorni di estrapolazione.
     """
     s = daily_series.dropna()
     if s.empty:
@@ -569,27 +573,28 @@ def forecast_short_term(daily_series: pd.Series, next_sat: date, n_days: int = 1
     y = window.values.astype(float)
     n = len(x)
 
-    # OLS
+    # OLS — stima solo la pendenza
     x_mean = x.mean()
     Sxx    = float(np.sum((x - x_mean) ** 2))
     b      = float(np.sum((x - x_mean) * (y - y.mean())) / Sxx) if Sxx > 0 else 0.0
     a      = float(y.mean() - b * x_mean)
 
-    x_pred = float((pd.Timestamp(next_sat) - window.index[0]).days)
-    y_pred = a + b * x_pred
+    # Ancora all'ultimo valore reale, non alla retta OLS
+    last_val    = float(window.iloc[-1])
+    days_ahead  = float((pd.Timestamp(next_sat) - window.index[-1]).days)
+    y_pred      = last_val + b * days_ahead
 
-    resid  = y - (a + b * x)
-    s_err  = float(np.sqrt(np.sum(resid ** 2) / max(n - 2, 1)))
-    # Intervallo di predizione al 95%
-    pred_se = s_err * float(np.sqrt(1 + 1 / n + (x_pred - x_mean) ** 2 / Sxx)) if Sxx > 0 else s_err
-    ci      = 1.96 * pred_se
+    # IC: residui OLS × fattore di estrapolazione
+    resid   = y - (a + b * x)
+    s_err   = float(np.sqrt(np.sum(resid ** 2) / max(n - 2, 1)))
+    ci      = 1.96 * s_err * float(np.sqrt(1 + days_ahead / max(n, 1)))
 
     return {
-        "ok":           True,
-        "forecast":     round(float(y_pred), 2),
-        "low":          round(float(y_pred - ci), 2),
-        "high":         round(float(y_pred + ci), 2),
-        "n_points":     n,
+        "ok":            True,
+        "forecast":      round(float(y_pred), 2),
+        "low":           round(float(y_pred - ci), 2),
+        "high":          round(float(y_pred + ci), 2),
+        "n_points":      n,
         "slope_per_day": round(float(b), 4),
     }
 
