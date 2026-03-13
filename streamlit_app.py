@@ -622,6 +622,83 @@ def forecast_short_term(daily_series: pd.Series, next_sat: date, n_days: int = 7
     }
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def forecast_gp_daily(daily_series: pd.Series, next_sat: date, n_days: int = 30):
+    """
+    Gaussian Process Regression sul peso giornaliero.
+
+    Kernel = trend lineare + oscillazioni smooth (~7gg) + rumore misura.
+
+    Tre componenti modellano la fisica del peso corporeo:
+      - DotProduct: cattura la discesa lineare del percorso di dimagrimento.
+      - RBF (~7 giorni): fluttuazioni smooth settimanali (acqua, pasti, cicli).
+      - WhiteKernel: rumore di misura della bilancia (~0.3 kg std).
+
+    Il GP stima automaticamente i parametri del kernel dai dati recenti,
+    adattandosi al ritmo attuale di perdita peso, e fornisce IC calibrati.
+    """
+    try:
+        from sklearn.gaussian_process import GaussianProcessRegressor
+        from sklearn.gaussian_process.kernels import (
+            RBF, DotProduct, WhiteKernel, ConstantKernel as C,
+        )
+    except ImportError:
+        return {"ok": False, "reason": "scikit-learn non installato"}
+
+    s = daily_series.dropna()
+    if len(s) < 7:
+        return {"ok": False}
+
+    cutoff = s.index.max() - pd.Timedelta(days=n_days - 1)
+    window = s[s.index >= cutoff]
+    if len(window) < 7:
+        return {"ok": False}
+
+    # X = giorni dalla prima misura della finestra (normalizzati 0-1)
+    t0      = window.index[0]
+    X_raw   = np.array([(d - t0).days for d in window.index], dtype=float)
+    X_scale = float(X_raw.max()) if X_raw.max() > 0 else 1.0
+    X_n     = (X_raw / X_scale).reshape(-1, 1)
+    y       = window.values.astype(float)
+
+    # Kernel calibrato per peso corporeo giornaliero
+    ls_rbf = 7.0 / X_scale   # ~7 giorni in unità normalizzate
+    kernel = (
+        C(1.0,  (0.1, 20.0)) * DotProduct(sigma_0=0.0)                                    # trend lineare
+        + C(0.3, (0.01, 5.0)) * RBF(length_scale=ls_rbf,                                  # fluttuazioni smooth
+                                     length_scale_bounds=(ls_rbf * 0.2, ls_rbf * 8.0))
+        + WhiteKernel(noise_level=0.09, noise_level_bounds=(0.005, 1.0))                   # rumore bilancia
+    )
+
+    gp = GaussianProcessRegressor(
+        kernel=kernel,
+        n_restarts_optimizer=5,
+        normalize_y=True,
+        random_state=42,
+    )
+    gp.fit(X_n, y)
+
+    days_ahead  = (pd.Timestamp(next_sat) - t0).days
+    X_pred_n    = np.array([[days_ahead / X_scale]])
+    y_mean, y_std = gp.predict(X_pred_n, return_std=True)
+    forecast    = float(y_mean[0])
+    ci          = 1.96 * float(y_std[0])
+
+    # Slope stimata come derivata discreta dal GP (ultimo giorno → sabato)
+    X_sl        = np.array([[(days_ahead - 1) / X_scale], [days_ahead / X_scale]])
+    y_sl        = gp.predict(X_sl)
+    slope_day   = float(y_sl[1] - y_sl[0])
+
+    return {
+        "ok":            True,
+        "forecast":      round(forecast, 2),
+        "low":           round(forecast - ci, 2),
+        "high":          round(forecast + ci, 2),
+        "n_points":      len(window),
+        "slope_per_day": round(slope_day, 4),
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════
 # SUPABASE
 # ═══════════════════════════════════════════════════════════════════
@@ -820,6 +897,7 @@ hw_rmse        = float(hw["rmse"])        if hw.get("ok") else None
 _hw_next_sat  = float(hw["last_level"] + hw["last_trend"]) if hw.get("ok") else None
 fc_short      = forecast_short_term(daily_series, next_saturday(date.today()), n_days=7,
                                     hw_next_sat=_hw_next_sat, hw_rmse=hw_rmse)
+fc_gp         = forecast_gp_daily(daily_series, next_saturday(date.today()), n_days=30)
 
 # ═══════════════════════════════════════════════════════════════════
 # HEADER
@@ -878,16 +956,24 @@ with tab_dash:
             st.warning("Dati HW insufficienti.")
 
     with col_rt:
-        st.caption("📊 Reale (regressione 7 giorni)")
-        if fc_short.get("ok"):
-            rt_delta = fc_short["forecast"] - last_w
+        if fc_gp.get("ok"):
+            st.caption("📊 Reale (Gaussian Process 30 giorni)")
+            rt_delta   = fc_gp["forecast"] - last_w
+            slope_week = fc_gp["slope_per_day"] * 7
+            st.metric("Peso previsto", f"{fc_gp['forecast']:.2f} kg",
+                      f"{rt_delta:+.2f} kg vs ultima misura", delta_color="inverse")
+            st.metric("IC 95%", f"{fc_gp['low']:.2f} – {fc_gp['high']:.2f} kg")
+            st.caption(f"Ritmo stimato: {slope_week:+.2f} kg/sett · su {fc_gp['n_points']} punti")
+        elif fc_short.get("ok"):
+            st.caption("📊 Reale (blend HW + regressione 7 giorni)")
+            rt_delta   = fc_short["forecast"] - last_w
             slope_week = fc_short["slope_per_day"] * 7
             st.metric("Peso previsto", f"{fc_short['forecast']:.2f} kg",
                       f"{rt_delta:+.2f} kg vs ultima misura", delta_color="inverse")
             st.metric("IC 95%", f"{fc_short['low']:.2f} – {fc_short['high']:.2f} kg")
             st.caption(f"Ritmo stimato: {slope_week:+.2f} kg/sett · su {fc_short['n_points']} punti")
         else:
-            st.warning("Dati recenti insufficienti (min 3 punti).")
+            st.warning("Dati recenti insufficienti (min 7 punti).")
 
     # ── Progress ───────────────────────────────────────────────────
     st.markdown(
