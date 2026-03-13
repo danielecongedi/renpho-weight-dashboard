@@ -858,14 +858,13 @@ hw           = fit_hw_model(weekly_df, lookback_weeks=opt_lookback)
 fc_df        = hw_forecast_saturdays(hw, n_saturdays=int(n_fc_sats)) if hw.get("ok") else pd.DataFrame()
 target_date_est, days_to_target = estimate_target_date_hw(hw, float(target_weight))
 trend_change  = detect_trend_change(weekly_df)
+# Ritmo HW: trend per settimana (negativo = perdita)
+hw_weekly_loss = float(-hw["last_trend"]) if hw.get("ok") else None
+hw_rmse        = float(hw["rmse"])        if hw.get("ok") else None
 # HW forecast per il prossimo sabato (h=1): usato come base tendenziale nel blend
 _hw_next_sat  = float(hw["last_level"] + hw["last_trend"]) if hw.get("ok") else None
 fc_short      = forecast_short_term(daily_series, next_saturday(date.today()), n_days=7,
                                     hw_next_sat=_hw_next_sat, hw_rmse=hw_rmse)
-
-# Ritmo HW: trend per settimana (negativo = perdita)
-hw_weekly_loss = float(-hw["last_trend"]) if hw.get("ok") else None
-hw_rmse        = float(hw["rmse"])        if hw.get("ok") else None
 
 # ═══════════════════════════════════════════════════════════════════
 # HEADER
