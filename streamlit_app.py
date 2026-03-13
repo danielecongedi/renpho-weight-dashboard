@@ -375,7 +375,7 @@ def find_optimal_lookback(weekly_df: pd.DataFrame, candidates=None):
     Ritorna (best_lookback, best_oos_rmse).
     """
     if candidates is None:
-        candidates = [6, 8, 10, 12, 16, 20]
+        candidates = [4, 6, 8, 10, 12, 16, 20, 24]
     valid = weekly_df.dropna(subset=["anchor"]).reset_index(drop=True)
     best_k, best_rmse = candidates[0], np.inf
     for k in candidates:
@@ -389,7 +389,7 @@ def find_optimal_lookback(weekly_df: pd.DataFrame, candidates=None):
                 continue
             try:
                 fit = ExponentialSmoothing(
-                    y, trend="add", seasonal=None,
+                    y, trend="add", damped_trend=True, seasonal=None,
                     initialization_method="estimated"
                 ).fit(optimized=True, remove_bias=True)
                 pred = float(fit.level[-1]) + float(fit.trend[-1])
@@ -461,6 +461,7 @@ def fit_hw_model(weekly_df: pd.DataFrame, lookback_weeks: int = HW_LOOKBACK_WEEK
         model = ExponentialSmoothing(
             y_clean,
             trend="add",
+            damped_trend=True,
             seasonal=None,
             initialization_method="estimated",
         )
@@ -484,6 +485,7 @@ def fit_hw_model(weekly_df: pd.DataFrame, lookback_weeks: int = HW_LOOKBACK_WEEK
             "last_anchor": float(y_clean[-1]),
             "alpha": float(fit.params["smoothing_level"]),
             "beta":  float(fit.params.get("smoothing_trend", np.nan)),
+            "phi":   float(fit.params.get("damping_trend", np.nan)),
             "n_obs": int(mask.sum()),
             "weekly_df_used": sub,
         }
@@ -504,14 +506,22 @@ def hw_forecast_saturdays(hw: dict, n_saturdays: int = HW_FORECAST_SATS, n_boot:
 
     level     = hw["last_level"]
     trend     = hw["last_trend"]
+    phi       = float(hw.get("phi", np.nan))
     residuals = np.array(hw["residuals"])
     last_sat  = hw["last_saturday"]
     rng       = np.random.default_rng(42)
 
+    # Con damped trend la proiezione a orizzonte h è:
+    # level + trend * sum_{i=1}^{h} phi^i  = level + trend * phi*(1-phi^h)/(1-phi)
+    def _damped_center(h: int) -> float:
+        if np.isfinite(phi) and phi < 1.0 and phi > 0.0:
+            return level + trend * phi * (1 - phi ** h) / (1 - phi)
+        return level + h * trend   # fallback lineare se phi non disponibile
+
     rows = []
     for h in range(1, n_saturdays + 1):
         sat    = last_sat + pd.Timedelta(weeks=h)
-        center = level + h * trend
+        center = _damped_center(h)
         # Accumulo di h innovazioni campionate con reimmissione
         boot = np.array([
             center + float(np.sum(rng.choice(residuals, size=h, replace=True)))
@@ -533,15 +543,19 @@ def estimate_target_date_hw(hw: dict, target_w: float):
     Usa la previsione puntuale su un orizzonte lungo (max 3 anni = 156 sett).
     """
     if not hw.get("ok"): return None, None
-    level = hw["last_level"]
-    trend = hw["last_trend"]
+    level    = hw["last_level"]
+    trend    = hw["last_trend"]
+    phi      = float(hw.get("phi", np.nan))
     last_sat = hw["last_saturday"]
 
     if trend >= 0:   # non sta scendendo
         return None, None
 
     for h in range(1, 157):
-        center = level + h * trend
+        if np.isfinite(phi) and phi < 1.0 and phi > 0.0:
+            center = level + trend * phi * (1 - phi ** h) / (1 - phi)
+        else:
+            center = level + h * trend
         if center <= float(target_w):
             sat = last_sat + pd.Timedelta(weeks=h)
             days_from_today = (sat.date() - date.today()).days
@@ -549,17 +563,40 @@ def estimate_target_date_hw(hw: dict, target_w: float):
     return None, None
 
 
-def forecast_short_term(daily_series: pd.Series, next_sat: date, n_days: int = 7,
-                        hw_next_sat: float | None = None, hw_weight: float = 0.6):
+def _dow_offsets(daily_series: pd.Series) -> dict:
     """
-    Forecast 'reale' per il prossimo sabato: blend tra HW tendenziale e
-    misure recenti.
+    Calcola l'offset medio per giorno della settimana rispetto alla media
+    complessiva della serie. Usato per correggere l'ancora recente dal
+    bias sistematico (es. lunedì più pesante, venerdì più leggero).
+    Richiede almeno 2 settimane di dati per giorno.
+    """
+    s = daily_series.dropna()
+    if len(s) < 14:
+        return {}
+    overall = float(s.mean())
+    offsets = {}
+    for dow in range(7):
+        vals = s[s.index.dayofweek == dow]
+        if len(vals) >= 2:
+            offsets[dow] = float(vals.mean()) - overall
+    return offsets
 
-    y_pred = hw_weight × HW_prossimo_sabato + (1-hw_weight) × media_ultimi_3gg
 
-    Se hw_next_sat non è disponibile, ricade sulla sola media degli ultimi 3gg
-    proiettata con la slope OLS.
-    IC 95% basato sui residui OLS scalati per i giorni di estrapolazione.
+def forecast_short_term(daily_series: pd.Series, next_sat: date, n_days: int = 7,
+                        hw_next_sat: float | None = None, hw_rmse: float | None = None,
+                        hw_weight_base: float = 0.6):
+    """
+    Forecast 'reale' per il prossimo sabato con quattro miglioramenti:
+
+    1. Ancora EWM: media esponenzialmente pesata degli ultimi 3 giorni
+       (il giorno più recente conta più dei precedenti).
+    2. Correzione DOW: sottrae il bias storico per giorno della settimana
+       prima di calcolare l'ancora, eliminando la distorsione sistematica.
+    3. Blend adattivo: il peso dell'HW aumenta quando le misure recenti
+       sono vicine al livello atteso dall'HW (bassa deviazione), diminuisce
+       quando si discostano molto (alta deviazione → dare più peso al reale).
+    4. CI onesto: propagazione dell'incertezza sul blend
+       σ_blend = sqrt(w²·hw_rmse² + (1-w)²·ols_se²)
     """
     s = daily_series.dropna()
     if s.empty:
@@ -579,24 +616,46 @@ def forecast_short_term(daily_series: pd.Series, next_sat: date, n_days: int = 7
     Sxx    = float(np.sum((x - x_mean) ** 2))
     b      = float(np.sum((x - x_mean) * (y - y.mean())) / Sxx) if Sxx > 0 else 0.0
     a      = float(y.mean() - b * x_mean)
-
-    # Ancora recente: media degli ultimi 3 giorni
-    anchor_window  = window.iloc[-min(3, len(window)):]
-    recent_anchor  = float(anchor_window.mean())
-
-    days_ahead     = float((pd.Timestamp(next_sat) - window.index[-1]).days)
-
-    if hw_next_sat is not None:
-        # Blend: HW fornisce la tendenza di lungo, i giorni recenti la correzione
-        y_pred = hw_weight * hw_next_sat + (1.0 - hw_weight) * recent_anchor
-    else:
-        # Fallback: proiezione OLS dalla media recente
-        y_pred = recent_anchor + b * days_ahead
-
-    # IC: residui OLS × fattore di estrapolazione
     resid  = y - (a + b * x)
     s_err  = float(np.sqrt(np.sum(resid ** 2) / max(n - 2, 1)))
-    ci     = 1.96 * s_err * float(np.sqrt(1 + days_ahead / max(n, 1)))
+
+    days_ahead = float((pd.Timestamp(next_sat) - window.index[-1]).days)
+
+    # 1+2. Ancora EWM con correzione DOW sugli ultimi 3 giorni
+    anchor_window = window.iloc[-min(3, len(window)):]
+    dow_off       = _dow_offsets(daily_series)
+    k_anc         = len(anchor_window)
+    ewm_alpha     = 0.5
+    raw_weights   = np.array([ewm_alpha * (1 - ewm_alpha) ** (k_anc - 1 - i)
+                               for i in range(k_anc)], dtype=float)
+    ewm_weights   = raw_weights / raw_weights.sum()
+
+    corrected = np.array([
+        float(val) - dow_off.get(idx.dayofweek, 0.0)
+        for idx, val in anchor_window.items()
+    ])
+    recent_anchor = float(np.dot(ewm_weights, corrected))
+
+    # 3. Blend adattivo
+    if hw_next_sat is not None:
+        if hw_rmse is not None and hw_rmse > 0:
+            deviation          = abs(recent_anchor - (hw_next_sat - (hw_next_sat - recent_anchor))) / hw_rmse
+            adaptive_hw_weight = float(np.clip(hw_weight_base - 0.1 * deviation, 0.35, 0.75))
+        else:
+            adaptive_hw_weight = hw_weight_base
+        w      = adaptive_hw_weight
+        y_pred = w * hw_next_sat + (1.0 - w) * recent_anchor
+    else:
+        w      = 0.0
+        y_pred = recent_anchor + b * days_ahead
+
+    # 4. CI con propagazione incertezza blend
+    ols_ci = 1.96 * s_err * float(np.sqrt(1 + days_ahead / max(n, 1)))
+    if hw_rmse is not None and hw_next_sat is not None:
+        blend_se = float(np.sqrt((w * hw_rmse) ** 2 + ((1 - w) * s_err) ** 2))
+        ci       = 1.96 * blend_se
+    else:
+        ci = ols_ci
 
     return {
         "ok":            True,
@@ -802,7 +861,7 @@ trend_change  = detect_trend_change(weekly_df)
 # HW forecast per il prossimo sabato (h=1): usato come base tendenziale nel blend
 _hw_next_sat  = float(hw["last_level"] + hw["last_trend"]) if hw.get("ok") else None
 fc_short      = forecast_short_term(daily_series, next_saturday(date.today()), n_days=7,
-                                    hw_next_sat=_hw_next_sat)
+                                    hw_next_sat=_hw_next_sat, hw_rmse=hw_rmse)
 
 # Ritmo HW: trend per settimana (negativo = perdita)
 hw_weekly_loss = float(-hw["last_trend"]) if hw.get("ok") else None
