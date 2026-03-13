@@ -557,7 +557,7 @@ def forecast_short_term(daily_series: pd.Series, next_sat: date, n_days: int = 7
     (più stabile del solo ultimo valore) e cappà la slope a 0 in modo che
     il forecast non salga mai sopra il peso attuale.
 
-    y_pred = ancora_smooth + min(slope, 0) × giorni_al_sabato
+    y_pred = media_ultimi_3gg + slope × giorni_al_sabato
 
     IC 95% basato sui residui OLS scalati per i giorni di estrapolazione.
     """
@@ -584,17 +584,8 @@ def forecast_short_term(daily_series: pd.Series, next_sat: date, n_days: int = 7
     anchor_window = window.iloc[-min(3, len(window)):]
     last_val      = float(anchor_window.mean())
 
-    # Ultimo valore reale misurato (cap assoluto)
-    actual_last = float(window.iloc[-1])
-
-    # Slope cappata a 0: il forecast non può mai salire sopra il peso attuale
-    b_capped   = min(b, 0.0)
-
     days_ahead = float((pd.Timestamp(next_sat) - window.index[-1]).days)
-    y_pred     = last_val + b_capped * days_ahead
-
-    # Cap finale: il forecast non supera mai l'ultimo peso reale misurato
-    y_pred     = min(y_pred, actual_last)
+    y_pred     = last_val + b * days_ahead
 
     # IC: residui OLS × fattore di estrapolazione
     resid   = y - (a + b * x)
@@ -607,7 +598,7 @@ def forecast_short_term(daily_series: pd.Series, next_sat: date, n_days: int = 7
         "low":           round(float(y_pred - ci), 2),
         "high":          round(float(y_pred + ci), 2),
         "n_points":      n,
-        "slope_per_day": round(float(b_capped), 4),
+        "slope_per_day": round(float(b), 4),
     }
 
 
