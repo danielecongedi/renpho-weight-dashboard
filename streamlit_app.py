@@ -970,20 +970,6 @@ with tab_dash:
             f"RMSE={hw_rmse:.2f} kg (errore medio in-sample)",
             style=style), unsafe_allow_html=True)
 
-        # Banner "sei in pari con il piano?"
-        days_since = (date.today() - hw["last_saturday"].date()).days
-        expected_today = hw["last_level"] + (days_since / 7.0) * hw["last_trend"]
-        diff_plan = last_w - expected_today
-        if abs(diff_plan) > 0.05:
-            plan_style = "" if diff_plan < 0 else "red"
-            plan_icon  = "✅" if diff_plan < 0 else "⚠️"
-            plan_label = "Sei SOTTO il piano" if diff_plan < 0 else "Sei SOPRA il piano"
-            st.markdown(banner_html(
-                plan_icon,
-                f"{plan_label}: {diff_plan:+.2f} kg rispetto alla previsione di oggi",
-                f"Il modello si aspettava {expected_today:.2f} kg oggi · "
-                f"Ultima misura: {last_w:.2f} kg",
-                style=plan_style), unsafe_allow_html=True)
 
         # Banner cambio trend
         if trend_change is not None:
