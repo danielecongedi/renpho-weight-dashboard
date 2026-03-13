@@ -584,11 +584,17 @@ def forecast_short_term(daily_series: pd.Series, next_sat: date, n_days: int = 7
     anchor_window = window.iloc[-min(3, len(window)):]
     last_val      = float(anchor_window.mean())
 
+    # Ultimo valore reale misurato (cap assoluto)
+    actual_last = float(window.iloc[-1])
+
     # Slope cappata a 0: il forecast non può mai salire sopra il peso attuale
     b_capped   = min(b, 0.0)
 
     days_ahead = float((pd.Timestamp(next_sat) - window.index[-1]).days)
     y_pred     = last_val + b_capped * days_ahead
+
+    # Cap finale: il forecast non supera mai l'ultimo peso reale misurato
+    y_pred     = min(y_pred, actual_last)
 
     # IC: residui OLS × fattore di estrapolazione
     resid   = y - (a + b * x)
