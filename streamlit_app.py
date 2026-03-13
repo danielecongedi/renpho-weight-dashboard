@@ -502,7 +502,10 @@ def hw_forecast_saturdays(hw: dict, n_saturdays: int = HW_FORECAST_SATS, n_boot:
     if not hw.get("ok"):
         return pd.DataFrame()
 
-    level     = hw["last_level"]
+    # Ancora all'ultimo valore reale del sabato, non al livello smussato HW.
+    # Questo garantisce che il forecast parta dal peso effettivamente misurato
+    # (es. 80.45) e applichi il trend stimato, producendo aspettative realistiche.
+    anchor    = hw["last_anchor"]
     trend     = hw["last_trend"]
     residuals = np.array(hw["residuals"])
     last_sat  = hw["last_saturday"]
@@ -511,7 +514,7 @@ def hw_forecast_saturdays(hw: dict, n_saturdays: int = HW_FORECAST_SATS, n_boot:
     rows = []
     for h in range(1, n_saturdays + 1):
         sat    = last_sat + pd.Timedelta(weeks=h)
-        center = level + h * trend
+        center = anchor + h * trend
         # Accumulo di h innovazioni campionate con reimmissione
         boot = np.array([
             center + float(np.sum(rng.choice(residuals, size=h, replace=True)))
@@ -533,7 +536,7 @@ def estimate_target_date_hw(hw: dict, target_w: float):
     Usa la previsione puntuale su un orizzonte lungo (max 3 anni = 156 sett).
     """
     if not hw.get("ok"): return None, None
-    level    = hw["last_level"]
+    anchor   = hw["last_anchor"]
     trend    = hw["last_trend"]
     last_sat = hw["last_saturday"]
 
@@ -541,7 +544,7 @@ def estimate_target_date_hw(hw: dict, target_w: float):
         return None, None
 
     for h in range(1, 157):
-        center = level + h * trend
+        center = anchor + h * trend
         if center <= float(target_w):
             sat = last_sat + pd.Timedelta(weeks=h)
             days_from_today = (sat.date() - date.today()).days
@@ -893,11 +896,6 @@ trend_change  = detect_trend_change(weekly_df)
 # Ritmo HW: trend per settimana (negativo = perdita)
 hw_weekly_loss = float(-hw["last_trend"]) if hw.get("ok") else None
 hw_rmse        = float(hw["rmse"])        if hw.get("ok") else None
-# HW forecast per il prossimo sabato (h=1): usato come base tendenziale nel blend
-_hw_next_sat  = float(hw["last_level"] + hw["last_trend"]) if hw.get("ok") else None
-fc_short      = forecast_short_term(daily_series, next_saturday(date.today()), n_days=7,
-                                    hw_next_sat=_hw_next_sat, hw_rmse=hw_rmse)
-fc_gp         = forecast_gp_daily(daily_series, next_saturday(date.today()), n_days=30)
 
 # ═══════════════════════════════════════════════════════════════════
 # HEADER
@@ -941,39 +939,17 @@ with tab_dash:
     nxt_sat_date = next_saturday(date.today())
     st.markdown(section_html("🔮", f"Forecast prossimo sabato — {fmt_date_it(nxt_sat_date)}"), unsafe_allow_html=True)
 
-    col_hw, col_rt = st.columns(2)
-
-    with col_hw:
-        st.caption("📈 Tendenziale (Holt-Winters)")
-        if not fc_df.empty:
-            nxt      = fc_df.iloc[0]
-            nxt_fc   = float(nxt["forecast"])
-            nxt_delta = nxt_fc - last_w
-            st.metric("Peso previsto", f"{nxt_fc:.2f} kg",
-                      f"{nxt_delta:+.2f} kg vs ultima misura", delta_color="inverse")
-            st.metric("IC 95%", f"{float(nxt['low']):.2f} – {float(nxt['high']):.2f} kg")
-        else:
-            st.warning("Dati HW insufficienti.")
-
-    with col_rt:
-        if fc_gp.get("ok"):
-            st.caption("📊 Reale (Gaussian Process 30 giorni)")
-            rt_delta   = fc_gp["forecast"] - last_w
-            slope_week = fc_gp["slope_per_day"] * 7
-            st.metric("Peso previsto", f"{fc_gp['forecast']:.2f} kg",
-                      f"{rt_delta:+.2f} kg vs ultima misura", delta_color="inverse")
-            st.metric("IC 95%", f"{fc_gp['low']:.2f} – {fc_gp['high']:.2f} kg")
-            st.caption(f"Ritmo stimato: {slope_week:+.2f} kg/sett · su {fc_gp['n_points']} punti")
-        elif fc_short.get("ok"):
-            st.caption("📊 Reale (blend HW + regressione 7 giorni)")
-            rt_delta   = fc_short["forecast"] - last_w
-            slope_week = fc_short["slope_per_day"] * 7
-            st.metric("Peso previsto", f"{fc_short['forecast']:.2f} kg",
-                      f"{rt_delta:+.2f} kg vs ultima misura", delta_color="inverse")
-            st.metric("IC 95%", f"{fc_short['low']:.2f} – {fc_short['high']:.2f} kg")
-            st.caption(f"Ritmo stimato: {slope_week:+.2f} kg/sett · su {fc_short['n_points']} punti")
-        else:
-            st.warning("Dati recenti insufficienti (min 7 punti).")
+    if not fc_df.empty:
+        nxt       = fc_df.iloc[0]
+        nxt_fc    = float(nxt["forecast"])
+        nxt_delta = nxt_fc - last_w
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Peso previsto", f"{nxt_fc:.2f} kg",
+                  f"{nxt_delta:+.2f} kg vs ultima misura", delta_color="inverse")
+        c2.metric("IC 95%", f"{float(nxt['low']):.2f} – {float(nxt['high']):.2f} kg")
+        c3.metric("Ritmo stimato", f"{-hw['last_trend']:.2f} kg/sett" if hw.get("ok") else "—")
+    else:
+        st.warning("Dati HW insufficienti.")
 
     # ── Progress ───────────────────────────────────────────────────
     st.markdown(
