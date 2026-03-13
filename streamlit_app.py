@@ -552,13 +552,12 @@ def estimate_target_date_hw(hw: dict, target_w: float):
 def forecast_short_term(daily_series: pd.Series, next_sat: date, n_days: int = 7):
     """
     Forecast 'reale' per il prossimo sabato.
-    Stima la pendenza (kg/giorno) con OLS sugli ultimi n_days della serie
-    interpolata, ma àncora la previsione all'ULTIMO VALORE REALE per evitare
-    l'amplificazione dell'estrapolazione.
+    Usa OLS ponderato con pesi esponenziali (punti recenti pesano di più)
+    per stimare direzione e pendenza in modo robusto agli spike.
 
-    y_pred = ultimo_valore + slope × giorni_al_sabato
-
-    IC 95% basato sui residui OLS scalati per i giorni di estrapolazione.
+    Se la tendenza è discendente (b < 0) il forecast non supera mai
+    l'ultimo valore misurato — la previsione segue la direzione ma
+    non "rimbalza" sopra il punto di partenza.
     """
     s = daily_series.dropna()
     if s.empty:
@@ -573,21 +572,31 @@ def forecast_short_term(daily_series: pd.Series, next_sat: date, n_days: int = 7
     y = window.values.astype(float)
     n = len(x)
 
-    # OLS — stima solo la pendenza
-    x_mean = x.mean()
-    Sxx    = float(np.sum((x - x_mean) ** 2))
-    b      = float(np.sum((x - x_mean) * (y - y.mean())) / Sxx) if Sxx > 0 else 0.0
-    a      = float(y.mean() - b * x_mean)
+    # Pesi esponenziali: punti più recenti pesano di più (decay 0.3)
+    w = np.exp(0.3 * (x - x.max()))
+    w /= w.sum()
 
-    # Ancora all'ultimo valore reale, non alla retta OLS
-    last_val    = float(window.iloc[-1])
-    days_ahead  = float((pd.Timestamp(next_sat) - window.index[-1]).days)
-    y_pred      = last_val + b * days_ahead
+    # Weighted OLS
+    x_mean_w = float(np.sum(w * x))
+    y_mean_w = float(np.sum(w * y))
+    Sxx_w    = float(np.sum(w * (x - x_mean_w) ** 2))
+    Sxy_w    = float(np.sum(w * (x - x_mean_w) * (y - y_mean_w)))
+    b = float(Sxy_w / Sxx_w) if Sxx_w > 0 else 0.0
+    a = float(y_mean_w - b * x_mean_w)
 
-    # IC: residui OLS × fattore di estrapolazione
-    resid   = y - (a + b * x)
-    s_err   = float(np.sqrt(np.sum(resid ** 2) / max(n - 2, 1)))
-    ci      = 1.96 * s_err * float(np.sqrt(1 + days_ahead / max(n, 1)))
+    last_val   = float(window.iloc[-1])
+    x_pred     = float((pd.Timestamp(next_sat) - window.index[0]).days)
+    days_ahead = float((pd.Timestamp(next_sat) - window.index[-1]).days)
+    y_pred     = a + b * x_pred
+
+    # Tendenza discendente: mai sopra l'ultimo valore misurato
+    if b < 0:
+        y_pred = min(y_pred, last_val)
+
+    # IC: RMSE pesato × fattore di estrapolazione
+    resid  = y - (a + b * x)
+    s_err  = float(np.sqrt(np.sum(w * resid ** 2)))
+    ci     = 1.96 * s_err * float(np.sqrt(1 + days_ahead / max(n, 1)))
 
     return {
         "ok":            True,
