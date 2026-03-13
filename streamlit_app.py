@@ -549,16 +549,16 @@ def estimate_target_date_hw(hw: dict, target_w: float):
     return None, None
 
 
-def forecast_short_term(daily_series: pd.Series, next_sat: date, n_days: int = 7):
+def forecast_short_term(daily_series: pd.Series, next_sat: date, n_days: int = 7,
+                        hw_next_sat: float | None = None, hw_weight: float = 0.6):
     """
-    Forecast 'reale' per il prossimo sabato.
-    Stima la pendenza (kg/giorno) con OLS sugli ultimi n_days della serie
-    interpolata, àncora la previsione alla media degli ultimi 3 giorni
-    (più stabile del solo ultimo valore) e cappà la slope a 0 in modo che
-    il forecast non salga mai sopra il peso attuale.
+    Forecast 'reale' per il prossimo sabato: blend tra HW tendenziale e
+    misure recenti.
 
-    y_pred = media_ultimi_3gg + slope × giorni_al_sabato
+    y_pred = hw_weight × HW_prossimo_sabato + (1-hw_weight) × media_ultimi_3gg
 
+    Se hw_next_sat non è disponibile, ricade sulla sola media degli ultimi 3gg
+    proiettata con la slope OLS.
     IC 95% basato sui residui OLS scalati per i giorni di estrapolazione.
     """
     s = daily_series.dropna()
@@ -574,23 +574,29 @@ def forecast_short_term(daily_series: pd.Series, next_sat: date, n_days: int = 7
     y = window.values.astype(float)
     n = len(x)
 
-    # OLS — stima solo la pendenza
+    # OLS — stima la pendenza sui giorni recenti
     x_mean = x.mean()
     Sxx    = float(np.sum((x - x_mean) ** 2))
     b      = float(np.sum((x - x_mean) * (y - y.mean())) / Sxx) if Sxx > 0 else 0.0
     a      = float(y.mean() - b * x_mean)
 
-    # Ancora: media degli ultimi 3 giorni (riduce il peso del singolo giorno volatile)
-    anchor_window = window.iloc[-min(3, len(window)):]
-    last_val      = float(anchor_window.mean())
+    # Ancora recente: media degli ultimi 3 giorni
+    anchor_window  = window.iloc[-min(3, len(window)):]
+    recent_anchor  = float(anchor_window.mean())
 
-    days_ahead = float((pd.Timestamp(next_sat) - window.index[-1]).days)
-    y_pred     = last_val + b * days_ahead
+    days_ahead     = float((pd.Timestamp(next_sat) - window.index[-1]).days)
+
+    if hw_next_sat is not None:
+        # Blend: HW fornisce la tendenza di lungo, i giorni recenti la correzione
+        y_pred = hw_weight * hw_next_sat + (1.0 - hw_weight) * recent_anchor
+    else:
+        # Fallback: proiezione OLS dalla media recente
+        y_pred = recent_anchor + b * days_ahead
 
     # IC: residui OLS × fattore di estrapolazione
-    resid   = y - (a + b * x)
-    s_err   = float(np.sqrt(np.sum(resid ** 2) / max(n - 2, 1)))
-    ci      = 1.96 * s_err * float(np.sqrt(1 + days_ahead / max(n, 1)))
+    resid  = y - (a + b * x)
+    s_err  = float(np.sqrt(np.sum(resid ** 2) / max(n - 2, 1)))
+    ci     = 1.96 * s_err * float(np.sqrt(1 + days_ahead / max(n, 1)))
 
     return {
         "ok":            True,
@@ -793,7 +799,10 @@ hw           = fit_hw_model(weekly_df, lookback_weeks=opt_lookback)
 fc_df        = hw_forecast_saturdays(hw, n_saturdays=int(n_fc_sats)) if hw.get("ok") else pd.DataFrame()
 target_date_est, days_to_target = estimate_target_date_hw(hw, float(target_weight))
 trend_change  = detect_trend_change(weekly_df)
-fc_short      = forecast_short_term(daily_series, next_saturday(date.today()), n_days=7)
+# HW forecast per il prossimo sabato (h=1): usato come base tendenziale nel blend
+_hw_next_sat  = float(hw["last_level"] + hw["last_trend"]) if hw.get("ok") else None
+fc_short      = forecast_short_term(daily_series, next_saturday(date.today()), n_days=7,
+                                    hw_next_sat=_hw_next_sat)
 
 # Ritmo HW: trend per settimana (negativo = perdita)
 hw_weekly_loss = float(-hw["last_trend"]) if hw.get("ok") else None
