@@ -809,10 +809,17 @@ def last_meas(df):
 # ═══════════════════════════════════════════════════════════════════
 # SECRETS CHECK
 # ═══════════════════════════════════════════════════════════════════
-csv_url = st.secrets.get("CSV_URL","")
+try:
+    csv_url = st.secrets.get("CSV_URL","")
+except Exception:
+    csv_url = ""
 if not csv_url:
     st.error("⚠️ `CSV_URL` mancante nei Secrets."); st.stop()
-if not all(k in st.secrets for k in ("SUPABASE_URL","SUPABASE_KEY")):
+try:
+    _has_supabase = all(k in st.secrets for k in ("SUPABASE_URL","SUPABASE_KEY"))
+except Exception:
+    _has_supabase = False
+if not _has_supabase:
     st.error("⚠️ Credenziali Supabase mancanti."); st.stop()
 
 # ═══════════════════════════════════════════════════════════════════
