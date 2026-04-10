@@ -6,6 +6,7 @@ from scipy.interpolate import Akima1DInterpolator
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from supabase import create_client, Client
 from datetime import datetime, timedelta, date, time as dtime
+from typing import Optional
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -280,10 +281,6 @@ def loss_class(kg_lost):
 # ═══════════════════════════════════════════════════════════════════
 
 def build_daily_series(daily_df: pd.DataFrame) -> pd.Series:
-    """
-    Ritorna una Series con indice DatetimeIndex giornaliero completo.
-    Usa Akima per i gap ≤ 14 giorni, lascia NaN per i gap più lunghi.
-    """
     d = daily_df.copy().sort_values("date")
     d["date"] = pd.to_datetime(d["date"]).dt.normalize()
     s = d.set_index("date")["weight"].astype(float)
@@ -337,9 +334,6 @@ def local_anchor(series: pd.Series, target, max_dist=6):
     return float(np.sum(y * w) / np.sum(w))
 
 def build_weekly_anchors(daily_series: pd.Series) -> pd.DataFrame:
-    """
-    Costruisce la serie degli anchor settimanali (un valore per sabato).
-    """
     s_min = daily_series.dropna().index.min()
     s_max = daily_series.dropna().index.max()
     sat_range = pd.date_range(week_saturday(s_min), week_saturday(s_max), freq="7D")
@@ -349,31 +343,16 @@ def build_weekly_anchors(daily_series: pd.Series) -> pd.DataFrame:
         if v is not None:
             rows.append({"saturday": pd.to_datetime(sat), "anchor": float(v)})
     df = pd.DataFrame(rows).sort_values("saturday").reset_index(drop=True)
-    df["delta"] = df["anchor"].diff()           # negativo = perdita
-    df["loss"]  = (-df["delta"]).clip(lower=0)  # perdita come valore positivo
+    df["delta"] = df["anchor"].diff()
+    df["loss"]  = (-df["delta"]).clip(lower=0)
     return df
 
 # ═══════════════════════════════════════════════════════════════════
 # MODELLO HOLT-WINTERS SUI SABATI
 # ═══════════════════════════════════════════════════════════════════
-# Perché Holt-Winters:
-#   - La serie degli anchor settimanali ha un trend lineare discendente
-#     (perdita di peso) e rumore stocastico settimana per settimana.
-#   - Holt-Winters con trend additivo (senza stagionalità, dato che gli
-#     anchor sono già il "valore pulito" del sabato) produce:
-#       * α  — smorzamento del livello (risponde ai dati recenti)
-#       * β  — smorzamento del trend   (stima il ritmo di perdita)
-#   - Gli intervalli di confidenza sono calcolati sulla deviazione
-#     residua in-sample, scalata con √t (propagazione dell'incertezza).
-#   - Fallback a regressione lineare robusta se i dati sono troppo pochi.
 
 @st.cache_data(ttl=300, show_spinner=False)
 def find_optimal_lookback(weekly_df: pd.DataFrame, candidates=None):
-    """
-    Walk-forward cross-validation: prova diversi lookback e sceglie quello
-    con RMSE out-of-sample minimo.
-    Ritorna (best_lookback, best_oos_rmse).
-    """
     if candidates is None:
         candidates = [4, 6, 8, 10, 12, 16, 20, 24]
     valid = weekly_df.dropna(subset=["anchor"]).reset_index(drop=True)
@@ -405,11 +384,6 @@ def find_optimal_lookback(weekly_df: pd.DataFrame, candidates=None):
 
 
 def detect_trend_change(weekly_df: pd.DataFrame, short_weeks: int = 4, long_weeks: int = 12):
-    """
-    Confronta il trend lineare (kg/sett) delle ultime `short_weeks` settimane
-    con quello delle ultime `long_weeks`.
-    Ritorna dict con short_trend, long_trend, change_pct oppure None se dati insufficienti.
-    """
     valid = weekly_df.dropna(subset=["anchor"]).sort_values("saturday").reset_index(drop=True)
     if len(valid) < long_weeks:
         return None
@@ -434,22 +408,12 @@ def detect_trend_change(weekly_df: pd.DataFrame, short_weeks: int = 4, long_week
 
 @st.cache_data(ttl=300, show_spinner="Calcolo modello Holt-Winters…")
 def fit_hw_model(weekly_df: pd.DataFrame, lookback_weeks: int = HW_LOOKBACK_WEEKS):
-    """
-    Fitta Holt-Winters additivo (trend senza stagionalità) sulla serie
-    degli anchor settimanali degli ultimi `lookback_weeks` sabati.
-
-    Ritorna un dizionario con:
-      ok, fitted_values, residuals, rmse,
-      last_level, last_trend, last_saturday, last_anchor,
-      alpha, beta, n_obs, weekly_df_used
-    """
     if weekly_df.empty or len(weekly_df) < 6:
         return {"ok": False, "reason": "too_few_weeks"}
 
     sub = weekly_df.tail(lookback_weeks).copy().reset_index(drop=True)
     y   = sub["anchor"].values.astype(float)
 
-    # Rimuovi NaN eventali
     mask = np.isfinite(y)
     if mask.sum() < 6:
         return {"ok": False, "reason": "too_few_valid"}
@@ -468,8 +432,6 @@ def fit_hw_model(weekly_df: pd.DataFrame, lookback_weeks: int = HW_LOOKBACK_WEEK
         fitted   = fit.fittedvalues
         residuals = y_clean - fitted
         rmse     = float(np.sqrt(np.mean(residuals**2)))
-
-        # Livello e trend finale (ultimi parametri stimati)
         last_level = float(fit.level[-1])
         last_trend = float(fit.trend[-1])
 
@@ -492,19 +454,9 @@ def fit_hw_model(weekly_df: pd.DataFrame, lookback_weeks: int = HW_LOOKBACK_WEEK
 
 
 def hw_forecast_saturdays(hw: dict, n_saturdays: int = HW_FORECAST_SATS, n_boot: int = 500):
-    """
-    Produce n_saturdays previsioni future con Holt-Winters.
-    Intervallo di confidenza al 95% via bootstrap sui residui in-sample:
-    per ogni orizzonte h si campionano h residui con reimmissione e si
-    sommano al forecast puntuale — i percentili 2.5/97.5 formano il CI.
-    Questo evita l'assunzione di errori i.i.d. gaussiani dell'approccio analitico.
-    """
     if not hw.get("ok"):
         return pd.DataFrame()
 
-    # Ancora all'ultimo valore reale del sabato, non al livello smussato HW.
-    # Questo garantisce che il forecast parta dal peso effettivamente misurato
-    # (es. 80.45) e applichi il trend stimato, producendo aspettative realistiche.
     anchor    = hw["last_anchor"]
     trend     = hw["last_trend"]
     residuals = np.array(hw["residuals"])
@@ -515,7 +467,6 @@ def hw_forecast_saturdays(hw: dict, n_saturdays: int = HW_FORECAST_SATS, n_boot:
     for h in range(1, n_saturdays + 1):
         sat    = last_sat + pd.Timedelta(weeks=h)
         center = anchor + h * trend
-        # Accumulo di h innovazioni campionate con reimmissione
         boot = np.array([
             center + float(np.sum(rng.choice(residuals, size=h, replace=True)))
             for _ in range(n_boot)
@@ -531,16 +482,12 @@ def hw_forecast_saturdays(hw: dict, n_saturdays: int = HW_FORECAST_SATS, n_boot:
 
 
 def estimate_target_date_hw(hw: dict, target_w: float):
-    """
-    Stima la data in cui il forecast supera per la prima volta il target.
-    Usa la previsione puntuale su un orizzonte lungo (max 3 anni = 156 sett).
-    """
     if not hw.get("ok"): return None, None
     anchor   = hw["last_anchor"]
     trend    = hw["last_trend"]
     last_sat = hw["last_saturday"]
 
-    if trend >= 0:   # non sta scendendo
+    if trend >= 0:
         return None, None
 
     for h in range(1, 157):
@@ -552,19 +499,11 @@ def estimate_target_date_hw(hw: dict, target_w: float):
     return None, None
 
 
+# FIX: sostituito float | None (Python 3.10+) con Optional[float] (compatibile 3.8+)
 def forecast_short_term(daily_series: pd.Series, next_sat: date, n_days: int = 7,
-                        hw_next_sat: float | None = None, hw_rmse: float | None = None,
+                        hw_next_sat: Optional[float] = None,
+                        hw_rmse: Optional[float] = None,
                         hw_weight_base: float = 0.6):
-    """
-    Forecast 'reale' per il prossimo sabato.
-
-    1. Ancora EWM: media esponenzialmente pesata degli ultimi 3 giorni
-       (alpha=0.5, il giorno più recente conta di più).
-    2. Blend adattivo: peso HW si riduce se le misure recenti si discostano
-       dal livello HW atteso (max ±0.25 rispetto alla base).
-    3. CI con propagazione incertezza blend:
-       σ = sqrt(w²·hw_rmse² + (1-w)²·ols_se²)
-    """
     s = daily_series.dropna()
     if s.empty:
         return {"ok": False}
@@ -578,7 +517,6 @@ def forecast_short_term(daily_series: pd.Series, next_sat: date, n_days: int = 7
     y = window.values.astype(float)
     n = len(x)
 
-    # OLS — stima la pendenza sui giorni recenti
     x_mean = x.mean()
     Sxx    = float(np.sum((x - x_mean) ** 2))
     b      = float(np.sum((x - x_mean) * (y - y.mean())) / Sxx) if Sxx > 0 else 0.0
@@ -588,7 +526,6 @@ def forecast_short_term(daily_series: pd.Series, next_sat: date, n_days: int = 7
 
     days_ahead = float((pd.Timestamp(next_sat) - window.index[-1]).days)
 
-    # 1. Ancora EWM sugli ultimi 3 giorni
     anchor_window = window.iloc[-min(3, len(window)):]
     k_anc         = len(anchor_window)
     ewm_alpha     = 0.5
@@ -596,7 +533,6 @@ def forecast_short_term(daily_series: pd.Series, next_sat: date, n_days: int = 7
                                for i in range(k_anc)], dtype=float)
     recent_anchor = float(np.dot(raw_w / raw_w.sum(), anchor_window.values))
 
-    # 2. Blend adattivo
     if hw_next_sat is not None:
         if hw_rmse is not None and hw_rmse > 0:
             deviation          = abs(recent_anchor - hw_next_sat) / hw_rmse
@@ -609,7 +545,6 @@ def forecast_short_term(daily_series: pd.Series, next_sat: date, n_days: int = 7
         w      = 0.0
         y_pred = recent_anchor + b * days_ahead
 
-    # 3. CI con propagazione incertezza blend
     if hw_rmse is not None and hw_next_sat is not None:
         ci = 1.96 * float(np.sqrt((w * hw_rmse) ** 2 + ((1 - w) * s_err) ** 2))
     else:
@@ -626,20 +561,8 @@ def forecast_short_term(daily_series: pd.Series, next_sat: date, n_days: int = 7
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+# FIX: sostituito float | None (Python 3.10+) con Optional[float] (compatibile 3.8+)
 def forecast_gp_daily(daily_series: pd.Series, next_sat: date, n_days: int = 30):
-    """
-    Gaussian Process Regression sul peso giornaliero.
-
-    Kernel = trend lineare + oscillazioni smooth (~7gg) + rumore misura.
-
-    Tre componenti modellano la fisica del peso corporeo:
-      - DotProduct: cattura la discesa lineare del percorso di dimagrimento.
-      - RBF (~7 giorni): fluttuazioni smooth settimanali (acqua, pasti, cicli).
-      - WhiteKernel: rumore di misura della bilancia (~0.3 kg std).
-
-    Il GP stima automaticamente i parametri del kernel dai dati recenti,
-    adattandosi al ritmo attuale di perdita peso, e fornisce IC calibrati.
-    """
     try:
         from sklearn.gaussian_process import GaussianProcessRegressor
         from sklearn.gaussian_process.kernels import (
@@ -657,20 +580,18 @@ def forecast_gp_daily(daily_series: pd.Series, next_sat: date, n_days: int = 30)
     if len(window) < 7:
         return {"ok": False}
 
-    # X = giorni dalla prima misura della finestra (normalizzati 0-1)
     t0      = window.index[0]
     X_raw   = np.array([(d - t0).days for d in window.index], dtype=float)
     X_scale = float(X_raw.max()) if X_raw.max() > 0 else 1.0
     X_n     = (X_raw / X_scale).reshape(-1, 1)
     y       = window.values.astype(float)
 
-    # Kernel calibrato per peso corporeo giornaliero
-    ls_rbf = 7.0 / X_scale   # ~7 giorni in unità normalizzate
+    ls_rbf = 7.0 / X_scale
     kernel = (
-        C(1.0,  (0.1, 20.0)) * DotProduct(sigma_0=0.0)                                    # trend lineare
-        + C(0.3, (0.01, 5.0)) * RBF(length_scale=ls_rbf,                                  # fluttuazioni smooth
+        C(1.0,  (0.1, 20.0)) * DotProduct(sigma_0=0.0)
+        + C(0.3, (0.01, 5.0)) * RBF(length_scale=ls_rbf,
                                      length_scale_bounds=(ls_rbf * 0.2, ls_rbf * 8.0))
-        + WhiteKernel(noise_level=0.09, noise_level_bounds=(0.005, 1.0))                   # rumore bilancia
+        + WhiteKernel(noise_level=0.09, noise_level_bounds=(0.005, 1.0))
     )
 
     gp = GaussianProcessRegressor(
@@ -687,7 +608,6 @@ def forecast_gp_daily(daily_series: pd.Series, next_sat: date, n_days: int = 30)
     forecast    = float(y_mean[0])
     ci          = 1.96 * float(y_std[0])
 
-    # Slope stimata come derivata discreta dal GP (ultimo giorno → sabato)
     X_sl        = np.array([[(days_ahead - 1) / X_scale], [days_ahead / X_scale]])
     y_sl        = gp.predict(X_sl)
     slope_day   = float(y_sl[1] - y_sl[0])
@@ -720,7 +640,11 @@ def load_manual() -> pd.DataFrame:
     df["date"]   = pd.to_datetime(df["date"], errors="coerce")
     df["weight"] = pd.to_numeric(df["weight"], errors="coerce")
     df["bmi"]    = pd.to_numeric(df["bmi"],    errors="coerce")
-    df["source"] = df.get("source","manual").fillna("manual")
+    # FIX: uso .get() con fallback sicuro per colonna source
+    if "source" in df.columns:
+        df["source"] = df["source"].fillna("manual")
+    else:
+        df["source"] = "manual"
     return df.dropna(subset=["date","weight"]).sort_values("date").reset_index(drop=True)
 
 def _invalidate_data_caches():
@@ -807,13 +731,30 @@ def last_meas(df):
     return (m if not m.empty else dd).sort_values("date").iloc[-1]
 
 # ═══════════════════════════════════════════════════════════════════
-# SECRETS CHECK
+# SECRETS CHECK — FIX: validazione più robusta (controlla anche valori vuoti)
 # ═══════════════════════════════════════════════════════════════════
-csv_url = st.secrets.get("CSV_URL","")
+csv_url = st.secrets.get("CSV_URL", "")
 if not csv_url:
-    st.error("⚠️ `CSV_URL` mancante nei Secrets."); st.stop()
-if not all(k in st.secrets for k in ("SUPABASE_URL","SUPABASE_KEY")):
-    st.error("⚠️ Credenziali Supabase mancanti."); st.stop()
+    st.error("⚠️ `CSV_URL` mancante nei Secrets. Aggiungila su Streamlit Cloud → Settings → Secrets.")
+    st.stop()
+
+supabase_url = st.secrets.get("SUPABASE_URL", "")
+supabase_key = st.secrets.get("SUPABASE_KEY", "")
+
+if not supabase_url or not supabase_key:
+    st.error("⚠️ Credenziali Supabase mancanti o vuote nei Secrets.")
+    st.stop()
+
+if not supabase_url.startswith("https://"):
+    st.error(f"⚠️ SUPABASE_URL non valido: '{supabase_url}'. Deve iniziare con https://")
+    st.stop()
+
+if not supabase_key.startswith("eyJ"):
+    st.error(
+        "⚠️ SUPABASE_KEY non valido. Stai usando una chiave 'sb_publishable_...' che non è supportata.\n\n"
+        "Vai su supabase.com → Project Settings → API → copia la chiave **anon public** (inizia con eyJ...)."
+    )
+    st.stop()
 
 # ═══════════════════════════════════════════════════════════════════
 # SIDEBAR
@@ -893,7 +834,6 @@ hw           = fit_hw_model(weekly_df, lookback_weeks=opt_lookback)
 fc_df        = hw_forecast_saturdays(hw, n_saturdays=int(n_fc_sats)) if hw.get("ok") else pd.DataFrame()
 target_date_est, days_to_target = estimate_target_date_hw(hw, float(target_weight))
 trend_change  = detect_trend_change(weekly_df)
-# Ritmo HW: trend per settimana (negativo = perdita)
 hw_weekly_loss = float(-hw["last_trend"]) if hw.get("ok") else None
 hw_rmse        = float(hw["rmse"])        if hw.get("ok") else None
 
@@ -920,7 +860,6 @@ tab_dash, tab_manual, tab_forecast, tab_data = st.tabs(
 # ═══════════════════════════════════════════════════════════════════
 with tab_dash:
 
-    # ── KPI ────────────────────────────────────────────────────────
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("⚖️ Ultima misura",
               f"{last_w:.2f} kg", last_dt.strftime("%d %b  %H:%M"), delta_color="off")
@@ -935,7 +874,6 @@ with tab_dash:
               f"tra {days_to_target} giorni" if days_to_target else
               ("non converge" if hw.get("ok") else "dati insuff."))
 
-    # ── Forecast prossimo sabato ────────────────────────────────────
     nxt_sat_date = next_saturday(date.today())
     st.markdown(section_html("🔮", f"Forecast prossimo sabato — {fmt_date_it(nxt_sat_date)}"), unsafe_allow_html=True)
 
@@ -951,7 +889,6 @@ with tab_dash:
     else:
         st.warning("Dati HW insufficienti.")
 
-    # ── Progress ───────────────────────────────────────────────────
     st.markdown(
         f"**Progresso** — <b>{progress_pct:.1f}%</b> &nbsp;"
         f"<span style='color:#8c96a8;font-size:12px'>"
@@ -970,8 +907,6 @@ with tab_dash:
             f"RMSE={hw_rmse:.2f} kg (errore medio in-sample)",
             style=style), unsafe_allow_html=True)
 
-
-        # Banner cambio trend
         if trend_change is not None:
             cp = trend_change["change_pct"]
             if abs(cp) >= 30:
@@ -987,7 +922,6 @@ with tab_dash:
                     f"Variazione del ritmo: {cp:+.0f}% rispetto allo storico.",
                     style=tc_style), unsafe_allow_html=True)
 
-    # ── Medie kg/sett su 3 orizzonti ──────────────────────────────
     if not weekly_df.empty:
         wdf_valid = weekly_df.dropna(subset=["loss"]).copy()
         wdf_valid = wdf_valid[wdf_valid["loss"].between(0, 5)]
@@ -1003,16 +937,13 @@ with tab_dash:
 
         st.markdown(section_html("📊","Media kg/settimana persi"), unsafe_allow_html=True)
         pm1, pm2, pm3 = st.columns(3)
-        pm1.metric(
-            "Ultime 4 settimane",
+        pm1.metric("Ultime 4 settimane",
             f"−{pace_4:.2f} kg/sett" if pace_4 else "—",
             f"su {min(4, len(wdf_valid))} settimane reali")
-        pm2.metric(
-            "Ultime 8 settimane",
+        pm2.metric("Ultime 8 settimane",
             f"−{pace_8:.2f} kg/sett" if pace_8 else "—",
             f"su {min(8, len(wdf_valid))} settimane reali")
-        pm3.metric(
-            "Tutto lo storico",
+        pm3.metric("Tutto lo storico",
             f"−{pace_all:.2f} kg/sett" if pace_all else "—",
             f"su {len(wdf_valid)} settimane totali")
         st.markdown(nota_html(
@@ -1022,7 +953,6 @@ with tab_dash:
             "Il confronto tra 4, 8 settimane e storico ti dice se stai accelerando, rallentando o sei stabile."
         ), unsafe_allow_html=True)
 
-    # ── Grafico peso ────────────────────────────────────────────────
     st.markdown(section_html("📈", "Andamento del peso"), unsafe_allow_html=True)
 
     fig = go.Figure()
@@ -1057,7 +987,6 @@ with tab_dash:
             line=dict(color=PC["blue"], width=2.5),
             hovertemplate=f"<b>%{{x|%d %b}}</b><br>MA {ma_window}gg: %{{y:.2f}} kg<extra></extra>"))
 
-    # Punti anchor settimanali nel range visualizzato
     wdf_vis = weekly_df[
         (weekly_df["saturday"] >= pd.Timestamp(start_d)) &
         (weekly_df["saturday"] <= pd.Timestamp(end_d))
@@ -1070,7 +999,6 @@ with tab_dash:
                         line=dict(width=1.5, color="white")),
             hovertemplate="<b>%{x|%d %b}</b><br>Anchor sabato: %{y:.2f} kg<extra></extra>"))
 
-    # Linea forecast nel grafico principale
     if not fc_df.empty:
         fig.add_trace(go.Scatter(
             x=pd.concat([fc_df["saturday"], fc_df["saturday"].iloc[::-1]]),
@@ -1113,7 +1041,6 @@ with tab_dash:
         f"La <b>fascia verde</b> mostra la variabilità normale (±1σ su 7 giorni)."
     ), unsafe_allow_html=True)
 
-    # ── Tabella settimanale storica ─────────────────────────────────
     st.markdown(section_html("📋", "Peso per settimana — storico"), unsafe_allow_html=True)
 
     wdf_hist = weekly_df[
@@ -1122,7 +1049,6 @@ with tab_dash:
     ].copy()
 
     if not wdf_hist.empty:
-        # Costruisci mappa sabato→fitted dal modello HW (dove disponibile)
         fitted_map = {}
         if hw.get("ok"):
             hw_sub = hw["weekly_df_used"].copy()
@@ -1168,11 +1094,9 @@ with tab_dash:
             f"<b>Verde</b> = più di 0.30 kg persi · "
             f"<b>Arancione</b> = tra 0.10 e 0.30 kg · "
             f"<b>Rosso</b> = meno di 0.10 kg (plateau). "
-            f"<b>vs Forecast HW</b>: differenza tra peso reale e stima del modello per quel sabato "
-            f"(verde = sotto la previsione = meglio del previsto, rosso = sopra)."
+            f"<b>vs Forecast HW</b>: differenza tra peso reale e stima del modello per quel sabato."
         ), unsafe_allow_html=True)
 
-    # ── Ultime 10 misure ────────────────────────────────────────────
     st.markdown(section_html("🕐", "Ultime 10 misure registrate"), unsafe_allow_html=True)
     last10 = df_f.sort_values("date", ascending=False).head(10).copy()
     last10["Data"]      = last10["date"].dt.strftime("%Y-%m-%d  %H:%M")
@@ -1245,7 +1169,6 @@ with tab_forecast:
     if not hw.get("ok"):
         st.warning(f"Modello non disponibile: {hw.get('reason','dati insufficienti')}.")
     else:
-        # Riepilogo modello
         col_a, col_b, col_c = st.columns(3)
         col_a.metric("Ritmo stimato",
                      f"−{hw_weekly_loss:.2f} kg/sett",
@@ -1260,11 +1183,8 @@ with tab_forecast:
         st.markdown(nota_html(
             f"Il modello <b>Holt-Winters</b> con trend additivo è stato fittato sugli ultimi "
             f"<b>{hw['n_obs']} sabati</b>. "
-            f"Parametro α={hw['alpha']:.3f}: quanto il modello aggiorna il livello a ogni nuova misura "
-            f"(più alto = più reattivo). "
-            f"Il <b>RMSE ±{hw_rmse:.2f} kg</b> misura quanto il modello era preciso sulle settimane storiche già note. "
-            f"L'intervallo nella tabella è <b>±1.96·RMSE·√h</b> dove h è il numero di settimane nel futuro "
-            f"(l'incertezza cresce col tempo)."
+            f"Parametro α={hw['alpha']:.3f}: quanto il modello aggiorna il livello a ogni nuova misura. "
+            f"Il <b>RMSE ±{hw_rmse:.2f} kg</b> misura la precisione sulle settimane storiche già note."
         ), unsafe_allow_html=True)
 
         if target_date_est:
@@ -1273,17 +1193,14 @@ with tab_forecast:
                 "🏁",
                 f"Arrivo stimato al target ({float(target_weight):.1f} kg): "
                 f"{fmt_date_it(target_date_est)} — tra {days_to_target} giorni",
-                f"Basato su un ritmo di −{hw_weekly_loss:.2f} kg/sett. "
-                f"Se il ritmo cambia, la data cambia proporzionalmente.",
+                f"Basato su un ritmo di −{hw_weekly_loss:.2f} kg/sett.",
                 style=style), unsafe_allow_html=True)
 
-        # ── Grafico forecast ─────────────────────────────────────
         st.markdown(section_html("📈","Grafico forecast"), unsafe_allow_html=True)
 
         if not fc_df.empty:
             fig_fc = go.Figure()
 
-            # Banda ±95%
             fig_fc.add_trace(go.Scatter(
                 x=list(fc_df["saturday"]) + list(fc_df["saturday"])[::-1],
                 y=list(fc_df["high"])     + list(fc_df["low"])[::-1],
@@ -1292,7 +1209,6 @@ with tab_forecast:
                 name="Intervallo ±95%",
                 hoverinfo="skip"))
 
-            # Linea forecast
             fig_fc.add_trace(go.Scatter(
                 x=fc_df["saturday"], y=fc_df["forecast"],
                 mode="lines+markers", name="Previsione (sabati)",
@@ -1303,7 +1219,6 @@ with tab_forecast:
                     "<b>%{x|%d %b %Y}</b><br>"
                     "Previsto: <b>%{y:.2f} kg</b><extra></extra>")))
 
-            # Punti anchor storici (ultimi N)
             hist_pts = weekly_df.tail(int(n_fc_sats)).copy()
             fig_fc.add_trace(go.Scatter(
                 x=hist_pts["saturday"], y=hist_pts["anchor"],
@@ -1314,7 +1229,6 @@ with tab_forecast:
                     "<b>%{x|%d %b %Y}</b><br>"
                     "Reale: <b>%{y:.2f} kg</b><extra></extra>")))
 
-            # Target line
             fig_fc.add_hline(
                 y=float(target_weight), line_dash="dot",
                 line_color=PC["red"], line_width=1.5,
@@ -1322,7 +1236,6 @@ with tab_forecast:
                 annotation_font_color=PC["red"],
                 annotation_position="bottom right")
 
-            # Linea verticale oggi
             today_ts = pd.Timestamp(today).to_pydatetime()
             fig_fc.add_shape(type="line", xref="x", yref="paper",
                              x0=today_ts, x1=today_ts, y0=0, y1=1,
@@ -1348,19 +1261,9 @@ with tab_forecast:
                 yextra=dict(tickformat=".1f", ticksuffix=" kg")))
             st.plotly_chart(fig_fc, use_container_width=True)
 
-            st.markdown(nota_html(
-                f"<b>Linea arancione</b> = previsione puntuale ogni sabato (Holt-Winters). "
-                f"<b>Fascia arancione</b> = intervallo ±95%: il peso reale dovrebbe cadere qui ~95% delle volte. "
-                f"Si allarga nel tempo perché l'incertezza si accumula (formula: ±1.96 · RMSE · √settimane). "
-                f"<b>Punti verdi</b> = sabati storici reali usati per fittare il modello. "
-                f"<b>RMSE={hw_rmse:.2f} kg</b>: errore medio del modello sui sabati già noti."
-            ), unsafe_allow_html=True)
-
-        # ── Tabella sabati previsti ──────────────────────────────
         if not fc_df.empty:
             st.markdown(section_html("📅","Sabati previsti"), unsafe_allow_html=True)
 
-            # Costruisci HTML tabella con highlight target
             rows_html = ""
             for _, row in fc_df.iterrows():
                 sat_str = fmt_date_it(row["saturday"])
@@ -1370,7 +1273,6 @@ with tab_forecast:
                 dist    = round(fc_v - float(target_weight), 2)
                 dist_s  = f"{dist:+.2f} kg"
 
-                # Highlight se siamo vicini o sotto il target
                 row_style = ""
                 if fc_v <= float(target_weight):
                     row_style = ' style="background:#e8f7ef;"'
@@ -1394,15 +1296,6 @@ with tab_forecast:
                 f"</tr></thead>"
                 f"<tbody>{rows_html}</tbody></table>",
                 unsafe_allow_html=True)
-
-            st.markdown(nota_html(
-                f"<b>Peso previsto</b>: stima puntuale del modello per quel sabato. "
-                f"<b>Range ±95%</b>: forchetta entro cui cadrà il peso reale con probabilità ~95% "
-                f"(si allarga nel tempo perché l'incertezza si accumula). "
-                f"<b>Al target</b>: kg ancora mancanti — le righe verdi indicano che il target è raggiunto. "
-                f"Nota: il forecast assume che il ritmo rimanga costante. "
-                f"Se cambia dieta o attività fisica, il modello si aggiornerà alla prossima settimana."
-            ), unsafe_allow_html=True)
 
         st.caption(
             f"Holt-Winters additivo · α={hw['alpha']:.3f} · "
